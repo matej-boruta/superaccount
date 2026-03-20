@@ -3,10 +3,10 @@ import { NextResponse } from 'next/server'
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
 
-export async function POST(_: Request, { params }: { params: Promise<{ id: string }> }) {
-  const { id } = await params
+export async function POST(req: Request) {
+  const { fakturaId, transakceId } = await req.json()
   await fetch(
-    `${SUPABASE_URL}/rest/v1/faktury?id=eq.${id}`,
+    `${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}`,
     {
       method: 'PATCH',
       headers: {
@@ -15,7 +15,7 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
-      body: JSON.stringify({ stav: 'schvalena', zauctovano_at: new Date().toISOString() }),
+      body: JSON.stringify({ stav: 'sparovano', faktura_id: fakturaId }),
     }
   )
   return NextResponse.json({ ok: true })
