@@ -206,7 +206,7 @@ export async function POST() {
 
             // Find PDF download link
             const linkMatch = html.match(/href="(https:\/\/[^"]*(?:invoice|billing|faktura)[^"]*\.pdf[^"]*)"/i)
-              ?? html.match(/href="(https:\/\/payments\.google\.com[^"]*)"[^>]*>.*?(?:PDF|stáhn|download)/is)
+              ?? html.match(/href="(https:\/\/payments\.google\.com[^"]*)"/i)
               ?? html.match(/"(https:\/\/storage\.googleapis\.com[^"]*\.pdf[^"]*)"/i)
 
             if (!linkMatch) { accountResult.skipped++; continue }
