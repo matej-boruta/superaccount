@@ -539,9 +539,9 @@ export default function Home() {
             ) : filteredSorted.length === 0 ? (
               <div className="text-center py-20 text-[13px] text-gray-400">Žádné faktury</div>
             ) : (
-              <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-hidden">
+              <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-clip">
                 <table className="w-full">
-                  <thead>
+                  <thead className="sticky top-[57px] z-10 bg-white">
                     <tr className="border-b border-gray-100">
                       <th className="px-4 py-3 w-10">
                         {novaFiltered.length > 0 && tab === 'nova' && (
@@ -565,6 +565,7 @@ export default function Home() {
                       </th>
                       <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Dodavatel</th>
                       <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Faktura / VS</th>
+                      <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Vystavení</th>
                       <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Splatnost</th>
                       <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Kategorie</th>
                       <th className="text-right px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Částka</th>
@@ -618,6 +619,10 @@ export default function Home() {
                             {f.variabilni_symbol && (
                               <div className="text-[11px] font-mono text-gray-400 mt-0.5">VS {f.variabilni_symbol}</div>
                             )}
+                          </td>
+                          {/* col: Vystavení */}
+                          <td className="px-4 py-2.5">
+                            <div className="text-[13px] text-gray-700">{fmtDate(f.datum_vystaveni) || '—'}</div>
                           </td>
                           {/* col: Splatnost */}
                           <td className="px-4 py-2.5">

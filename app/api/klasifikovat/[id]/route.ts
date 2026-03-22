@@ -17,19 +17,35 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
   if (f.kategorie_id) return NextResponse.json({ kategorie_id: f.kategorie_id })
 
   // Check history: same ICO with kategorie_id already set
+  const sbHeaders = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
+  const sbPatch = (kategorie_id: number) => fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${id}`, {
+    method: 'PATCH',
+    headers: { ...sbHeaders, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+    body: JSON.stringify({ kategorie_id }),
+  })
+
   if (f.ico) {
     const histRes = await fetch(
       `${SUPABASE_URL}/rest/v1/faktury?ico=eq.${encodeURIComponent(f.ico)}&kategorie_id=not.is.null&select=kategorie_id&order=id.desc&limit=1`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+      { headers: sbHeaders }
     )
     const [prev] = await histRes.json()
     if (prev?.kategorie_id) {
-      await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${id}`, {
-        method: 'PATCH',
-        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-        body: JSON.stringify({ kategorie_id: prev.kategorie_id }),
-      })
-      return NextResponse.json({ kategorie_id: prev.kategorie_id, source: 'history' })
+      await sbPatch(prev.kategorie_id)
+      return NextResponse.json({ kategorie_id: prev.kategorie_id, source: 'history_ico' })
+    }
+  }
+
+  // Fallback: same dodavatel name with kategorie_id already set
+  if (f.dodavatel) {
+    const histRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/faktury?dodavatel=eq.${encodeURIComponent(f.dodavatel)}&kategorie_id=not.is.null&id=neq.${id}&select=kategorie_id&order=id.desc&limit=1`,
+      { headers: sbHeaders }
+    )
+    const [prev] = await histRes.json()
+    if (prev?.kategorie_id) {
+      await sbPatch(prev.kategorie_id)
+      return NextResponse.json({ kategorie_id: prev.kategorie_id, source: 'history_dodavatel' })
     }
   }
 

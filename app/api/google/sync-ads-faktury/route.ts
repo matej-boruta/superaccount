@@ -6,8 +6,9 @@
  *   1. Najde emaily od billing-noreply@google.com s Google Ads fakturou
  *   2. Extrahuje download link z HTML
  *   3. Stáhne PDF
- *   4. Parsuje přes Claude API (Anthropic)
- *   5. Uloží do Supabase faktury
+ *   4. Nahraje do Google Drive (format: YYYYMMDD_předmět mailu_název souboru.pdf)
+ *   5. Parsuje přes Claude API (Anthropic)
+ *   6. Uloží do Supabase faktury (vč. gdrive_file_id)
  */
 import { NextResponse } from 'next/server'
 
@@ -16,8 +17,40 @@ const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY!
+const DRIVE_FOLDER_ID = '19uD7bGxQTbDLn57L4tpBtH-9bG4lYXl8'
 
 const SB = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
+
+function buildDriveFilename(emailDate: string, subject: string, originalFilename: string): string {
+  const datePart = emailDate.replace(/-/g, '')
+  const subjectPart = subject.replace(/[^a-zA-Z0-9áčďéěíňóřšťůúýžÁČĎÉĚÍŇÓŘŠŤŮÚÝŽ \-_]/g, '').trim().substring(0, 80)
+  const filePart = originalFilename.replace(/\.pdf$/i, '').replace(/[^a-zA-Z0-9áčďéěíňóřšťůúýžÁČĎÉĚÍŇÓŘŠŤŮÚÝŽ \-_]/g, '').trim()
+  return `${datePart}_${subjectPart}_${filePart}.pdf`
+}
+
+async function uploadToDrive(accessToken: string, pdfBuffer: Buffer, filename: string): Promise<string | null> {
+  try {
+    const metadata = JSON.stringify({ name: filename, parents: [DRIVE_FOLDER_ID] })
+    const boundary = 'faktura_boundary'
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n--${boundary}\r\nContent-Type: application/pdf\r\n\r\n`),
+      pdfBuffer,
+      Buffer.from(`\r\n--${boundary}--`),
+    ])
+    const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': `multipart/related; boundary=${boundary}`,
+      },
+      body,
+    })
+    const data = await res.json()
+    return data.id ?? null
+  } catch {
+    return null
+  }
+}
 
 async function getAccessToken(refreshToken: string): Promise<string> {
   const res = await fetch('https://oauth2.googleapis.com/token', {
@@ -137,10 +170,10 @@ export async function POST() {
     try {
       const accessToken = await getAccessToken(tokenRow.refresh_token)
 
-      // Search for Google Ads invoice emails (last 180 days)
-      const query = 'from:(billing-noreply@google.com OR payments-noreply@google.com) subject:(invoice OR faktura OR "your invoice") newer_than:180d'
+      // Search for Google invoice emails from 1.1.2025
+      const query = 'from:(billing-noreply@google.com OR payments-noreply@google.com OR noreply-apps-invoice@google.com OR invoicing@google.com) subject:(invoice OR faktura OR "your invoice") after:2025/1/1'
       const searchRes = await fetch(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=100`,
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=500`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       )
       const searchData = await searchRes.json()
@@ -177,18 +210,25 @@ export async function POST() {
             String(p.filename ?? '').toLowerCase().endsWith('.pdf')
           )
 
+          // Check if already imported (and if so, whether amounts are missing)
+          const existingRows = await (await fetch(
+            `${SUPABASE_URL}/rest/v1/faktury?email_id=eq.${msgId}&limit=1&select=id,castka_s_dph`,
+            { headers: SB }
+          )).json()
+          const existingRow = Array.isArray(existingRows) ? existingRows[0] : null
+          const needsReparsing = existingRow && existingRow.castka_s_dph == null
+          if (existingRow && !needsReparsing) { accountResult.skipped++; continue }
+
           if (pdfPart) {
             const attachmentId = (pdfPart.body as Record<string, unknown>)?.attachmentId as string
             pdfFilename = String(pdfPart.filename ?? 'invoice.pdf')
 
-            // Skip if already imported
-            const existing = await (await fetch(
-              `${SUPABASE_URL}/rest/v1/faktury?email_id=eq.${msgId}&limit=1`,
-              { headers: SB }
-            )).json()
-            if (existing.length > 0) { accountResult.skipped++; continue }
-
-            if (attachmentId) {
+            const inlineData = String((pdfPart.body as Record<string, unknown>)?.data ?? '')
+            if (inlineData) {
+              // Small attachment: data is inline in body.data
+              pdfBase64 = inlineData.replace(/-/g, '+').replace(/_/g, '/')
+            } else if (attachmentId) {
+              // Large attachment: fetch via attachment endpoint
               const attRes = await fetch(
                 `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msgId}/attachments/${attachmentId}`,
                 { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -213,13 +253,6 @@ export async function POST() {
 
             const pdfUrl = linkMatch[1].replace(/&amp;/g, '&')
 
-            // Skip if already imported
-            const existing = await (await fetch(
-              `${SUPABASE_URL}/rest/v1/faktury?email_id=eq.${msgId}&limit=1`,
-              { headers: SB }
-            )).json()
-            if (existing.length > 0) { accountResult.skipped++; continue }
-
             // Download PDF with Google auth
             const pdfRes = await fetch(pdfUrl, {
               headers: { Authorization: `Bearer ${accessToken}` },
@@ -233,20 +266,33 @@ export async function POST() {
 
           if (!pdfBase64) { accountResult.skipped++; continue }
 
+          // Upload to Google Drive (YYYYMMDD_předmět_soubor.pdf)
+          const driveFilename = buildDriveFilename(emailDate, subject, pdfFilename)
+          const pdfBuffer = Buffer.from(pdfBase64, 'base64')
+          const gdriveFileId = await uploadToDrive(accessToken, pdfBuffer, driveFilename)
+
           // Parse PDF with Claude
           const parsed = await parsePdfWithClaude(pdfBase64, pdfFilename)
 
-          // Store in Supabase
-          await fetch(`${SUPABASE_URL}/rest/v1/faktury`, {
-            method: 'POST',
-            headers: { ...SB, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-            body: JSON.stringify({
-              ...parsed,
-              stav: 'nova',
-              email_id: msgId,
-              predmet: subject.substring(0, 200),
-            }),
-          })
+          if (needsReparsing) {
+            await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${existingRow.id}`, {
+              method: 'PATCH',
+              headers: { ...SB, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+              body: JSON.stringify({ ...parsed, ...(gdriveFileId ? { gdrive_file_id: gdriveFileId } : {}) }),
+            })
+          } else {
+            await fetch(`${SUPABASE_URL}/rest/v1/faktury`, {
+              method: 'POST',
+              headers: { ...SB, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+              body: JSON.stringify({
+                ...parsed,
+                stav: 'nova',
+                email_id: msgId,
+                predmet: subject.substring(0, 200),
+                ...(gdriveFileId ? { gdrive_file_id: gdriveFileId } : {}),
+              }),
+            })
+          }
           accountResult.imported++
 
         } catch (e) {

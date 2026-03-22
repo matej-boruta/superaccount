@@ -3,9 +3,10 @@ import { NextResponse } from 'next/server'
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID!
 const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI!
 
-// Scopes: Gmail read (faktury z mailu) + Ads readonly (direct API fallback)
+// Scopes: Gmail read + Drive (upload/sync faktur) + userinfo
 const SCOPES = [
   'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/drive.file',
   'https://www.googleapis.com/auth/userinfo.email',
 ].join(' ')
 

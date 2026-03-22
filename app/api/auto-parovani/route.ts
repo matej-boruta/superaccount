@@ -14,14 +14,26 @@ const SB_HEADERS = {
   Prefer: 'return=minimal',
 }
 
-// Card payment suppliers: keyword in transakce.zprava → must also appear in faktura.dodavatel
-const CARD_SUPPLIERS: { keyword: string; dodavatelMatch: string }[] = [
-  { keyword: 'SEZNAM', dodavatelMatch: 'SEZNAM' },
-  { keyword: 'GOOGLE', dodavatelMatch: 'GOOGLE' },
-]
-
 function daysDiff(a: string, b: string): number {
   return Math.abs((new Date(a).getTime() - new Date(b).getTime()) / 86400000)
+}
+
+// Extract original foreign currency amount from Fio card transaction message
+// e.g. "Nákup: WWW.TWILIO.COM, ..., částka  44.95 USD" → { amount: 44.95, mena: 'USD' }
+function extractFxFromZprava(zprava: string): { amount: number; mena: string } | null {
+  const match = zprava.match(/(?:částka|amount)\s+([\d.,]+)\s+([A-Z]{3})/i)
+  if (!match) return null
+  const amount = parseFloat(match[1].replace(',', '.'))
+  const mena = match[2].toUpperCase()
+  if (isNaN(amount) || mena === 'CZK') return null
+  return { amount, mena }
+}
+
+// Extract payment date from Fio zprava: "dne 11.3.2026" → "2026-03-11"
+function extractDateFromZprava(zprava: string): string | null {
+  const m = zprava.match(/dne\s+(\d{1,2})\.(\d{1,2})\.(\d{4})/i)
+  if (!m) return null
+  return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`
 }
 
 // Fetch EUR/USD/GBP→CZK rate from ČNB for a given date
@@ -54,17 +66,38 @@ async function getKurz(mena: string, datum: string): Promise<number> {
   return fallback[mena] ?? 1
 }
 
+type CardRule = { keyword: string; dodavatelMatch: string }
+
+async function getCardRules(): Promise<CardRule[]> {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/dodavatel_pravidla?typ_platby=eq.karta&dodavatel_pattern=not.is.null&select=dodavatel_pattern`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    )
+    const rows: { dodavatel_pattern: string }[] = await res.json()
+    if (!Array.isArray(rows)) return []
+    // dodavatel_pattern je LIKE pattern (např. "Google%", "SEZNAM%")
+    // keyword = prefix bez %, dodavatelMatch = totéž (pro shodu v obou polích)
+    return rows
+      .filter(r => r.dodavatel_pattern)
+      .map(r => {
+        const keyword = r.dodavatel_pattern.replace(/%/g, '').toUpperCase()
+        return { keyword, dodavatelMatch: keyword }
+      })
+  } catch { return [] }
+}
+
 async function matchByCard(
   t: Record<string, unknown>,
-  f: Record<string, unknown>
+  f: Record<string, unknown>,
+  cardRules: CardRule[]
 ): Promise<boolean> {
   if (t.typ !== 'Platba kartou') return false
   const zprava = String(t.zprava || '').toUpperCase()
   const dodavatel = String(f.dodavatel || '').toUpperCase()
 
-  const supplierMatch = CARD_SUPPLIERS.some(
-    s => zprava.includes(s.keyword) && dodavatel.includes(s.dodavatelMatch)
-  )
+  // keyword z dodavatel_pattern (např. "GOOGLE", "SEZNAM") — hledáme v textu zprávy transakce
+  const supplierMatch = cardRules.some(s => zprava.includes(s.keyword))
   if (!supplierMatch) return false
 
   // Amount match — handle EUR/USD faktury vs CZK bank transactions
@@ -86,11 +119,12 @@ async function matchByCard(
   }
   if (!amountMatch) return false
 
-  // Date within 5 days (EUR invoices may have bigger date gap)
+  // Date: "dne" date from zprava = datum when card was charged (= datum_splatnosti).
+  // Bank posts it D+1. Tolerance ±2 days for weekends/holidays.
   const fDate = String(f.datum_splatnosti || f.datum_vystaveni || '').split('T')[0]
-  const tDate = String(t.datum || '').split('T')[0]
+  const tDate = extractDateFromZprava(String(t.zprava || '')) ?? String(t.datum || '').split('T')[0]
   if (!fDate || !tDate) return false
-  if (daysDiff(fDate, tDate) > 5) return false
+  if (daysDiff(fDate, tDate) > 2) return false
 
   return true
 }
@@ -234,11 +268,14 @@ export async function POST() {
 
   const results: { faktura_id: number; transakce_id: number; match: string }[] = []
 
+  // Load card rules from dodavatel_pravidla (dynamic, includes Twilio/Daktela/etc.)
+  const cardRules = await getCardRules()
+
   // ── CARD TRANSACTIONS: match nova + schvalena faktury via supplier name + amount + date ──
   const cardTranakce = transakce.filter(t => t.typ === 'Platba kartou')
 
   for (const f of [...nova, ...schvalena]) {
-    const matchResults = await Promise.all(cardTranakce.map(t => matchByCard(t, f)))
+    const matchResults = await Promise.all(cardTranakce.map(t => matchByCard(t, f, cardRules)))
     const match = cardTranakce.find((_, i) => matchResults[i])
     if (!match) continue
 
@@ -272,13 +309,34 @@ export async function POST() {
     const fVs = String(f.variabilni_symbol || '').trim()
     const fCastka = Number(f.castka_s_dph)
 
+    const fMena = String(f.mena || 'CZK')
+
+    // Helper: check if transaction amount matches faktura amount (with currency conversion)
+    const amountMatches = async (t: Record<string, unknown>) => {
+      const tCastka = Math.abs(Number(t.castka))
+      const tMena = String(t.mena || 'CZK')
+      // 0. Extract original FX from zprava (most reliable for card payments)
+      const fx = extractFxFromZprava(String(t.zprava || ''))
+      if (fx && fx.mena === fMena && Math.abs(fx.amount - fCastka) / fCastka < 0.01) return true
+      // 1. Same currency → direct compare
+      if (fMena === tMena) return Math.abs(tCastka - fCastka) / Math.max(fCastka, 1) < 0.02
+      // 2. Foreign invoice, CZK transaction → convert via ČNB
+      if (fMena !== 'CZK' && tMena === 'CZK') {
+        const tDate = String(t.datum || '').split('T')[0]
+        const kurz = await getKurz(fMena, tDate)
+        const fCzkEquiv = fCastka * kurz
+        return fCzkEquiv > 0 && Math.abs(tCastka - fCzkEquiv) / fCzkEquiv < 0.02
+      }
+      return false
+    }
+
     // Priority 1: VS + amount
-    let match = transakce.find(t =>
-      String(t.variabilni_symbol || '').trim() === fVs &&
-      fVs !== '' &&
-      Math.abs(Number(t.castka) - fCastka) < 1
-    )
+    let match: Record<string, unknown> | undefined
     let matchType = 'vs+castka'
+    for (const t of transakce) {
+      if (String(t.variabilni_symbol || '').trim() !== fVs || fVs === '') continue
+      if (await amountMatches(t)) { match = t; break }
+    }
 
     // Priority 2: VS only
     if (!match && fVs) {
@@ -286,10 +344,15 @@ export async function POST() {
       matchType = 'vs'
     }
 
-    // Priority 3: amount only (outgoing)
+    // Priority 3: amount only — "dne" date = datum_splatnosti ±2 days
     if (!match) {
-      match = transakce.find(t => Math.abs(Number(t.castka) - fCastka) < 1 && Number(t.castka) < 0)
-      matchType = 'castka'
+      const fDate2 = String(f.datum_splatnosti || f.datum_vystaveni || '').split('T')[0]
+      for (const t of transakce) {
+        if (Number(t.castka) >= 0) continue
+        const tDate2 = extractDateFromZprava(String(t.zprava || '')) ?? String(t.datum || '').split('T')[0]
+        if (fDate2 && tDate2 && daysDiff(fDate2, tDate2) > 2) continue
+        if (await amountMatches(t)) { match = t; matchType = 'castka'; break }
+      }
     }
 
     if (!match) continue
@@ -307,6 +370,81 @@ export async function POST() {
       })).json())?.winstrom?.['faktura-prijata']?.[0]
 
       if (abraFa?.id) await createAbraBanka(f, match, abraFa.id)
+    } catch { /* non-blocking */ }
+
+    results.push({ faktura_id: fakturaId, transakce_id: transakceId, match: matchType })
+  }
+
+  // ── FOREIGN CURRENCY FALLBACK: match any unpaired faktura in EUR/USD/etc. ──
+  // Priority: 1) same-currency transaction, 2) CZK transaction via ČNB rate (±3%)
+  const allUnpaired = [...nova, ...schvalena].filter(
+    f => !results.find(r => r.faktura_id === (f.id as number))
+  )
+  for (const f of allUnpaired) {
+    const fMena = String(f.mena || 'CZK')
+    if (fMena === 'CZK') continue
+
+    const fCastka = Number(f.castka_s_dph)
+    const fDate = String(f.datum_splatnosti || f.datum_vystaveni || '').split('T')[0]
+    const fakturaId = f.id as number
+
+    let match: Record<string, unknown> | undefined
+    let matchType = ''
+
+    // 0. Extract original FX amount from transaction message (most reliable for card payments)
+    // e.g. Fio: "Nákup: WWW.TWILIO.COM, ..., částka 44.95 USD"
+    for (const t of transakce) {
+      if (Number(t.castka) >= 0) continue
+      const tDate = String(t.datum || '').split('T')[0]
+      if (fDate && tDate && daysDiff(fDate, tDate) > 7) continue
+      const fx = extractFxFromZprava(String(t.zprava || ''))
+      if (fx && fx.mena === fMena && Math.abs(fx.amount - fCastka) / fCastka < 0.01) {
+        match = t
+        matchType = `fx_zprava_${fMena}`
+        break
+      }
+    }
+
+    // 1. Same currency (e.g. USD invoice → USD transaction)
+    for (const t of transakce) {
+      if (Number(t.castka) >= 0) continue
+      if (String(t.mena || 'CZK') !== fMena) continue
+      const tDate = String(t.datum || '').split('T')[0]
+      if (fDate && tDate && daysDiff(fDate, tDate) > 7) continue
+      if (Math.abs(Math.abs(Number(t.castka)) - fCastka) / fCastka < 0.03) {
+        match = t
+        matchType = `fx_same_${fMena}`
+        break
+      }
+    }
+
+    // 2. CZK transaction with ČNB rate conversion
+    if (!match) {
+      for (const t of transakce) {
+        if (Number(t.castka) >= 0) continue
+        const tDate = String(t.datum || '').split('T')[0]
+        if (fDate && tDate && daysDiff(fDate, tDate) > 7) continue
+        const kurz = await getKurz(fMena, tDate || fDate)
+        const fCzkEquiv = fCastka * kurz
+        const tCastka = Math.abs(Number(t.castka))
+        if (fCzkEquiv > 0 && Math.abs(tCastka - fCzkEquiv) / fCzkEquiv < 0.03) {
+          match = t
+          matchType = `fx_${fMena}→CZK_kurz_${kurz.toFixed(2)}`
+          break
+        }
+      }
+    }
+
+    if (!match) continue
+
+    const transakceId = match.id as number
+    transakce.splice(transakce.indexOf(match), 1)
+
+    await pairInSupabase(fakturaId, transakceId)
+
+    try {
+      const abraFaId = await createAbraFakturaPrijata(f, true)
+      if (abraFaId) await createAbraBanka(f, match, abraFaId)
     } catch { /* non-blocking */ }
 
     results.push({ faktura_id: fakturaId, transakce_id: transakceId, match: matchType })
