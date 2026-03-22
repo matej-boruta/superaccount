@@ -24,10 +24,40 @@ function daysDiff(a: string, b: string): number {
   return Math.abs((new Date(a).getTime() - new Date(b).getTime()) / 86400000)
 }
 
-function matchByCard(
+// Fetch EUR/USD/GBP→CZK rate from ČNB for a given date
+const kurzyCache: Record<string, number> = {}
+async function getKurz(mena: string, datum: string): Promise<number> {
+  if (mena === 'CZK') return 1
+  const key = `${mena}_${datum}`
+  if (kurzyCache[key]) return kurzyCache[key]
+
+  try {
+    // ČNB daily rates API
+    const [y, m, d] = datum.split('-')
+    const url = `https://www.cnb.cz/en/financial-markets/foreign-exchange-market/central-bank-exchange-rate-fixing/central-bank-exchange-rate-fixing/daily.txt?date=${d}.${m}.${y}`
+    const res = await fetch(url)
+    const text = await res.text()
+    // Format: "Country|Currency|Amount|Code|Rate"
+    const line = text.split('\n').find(l => l.includes(`|${mena}|`))
+    if (line) {
+      const parts = line.split('|')
+      const amount = parseFloat(parts[2])
+      const rate = parseFloat(parts[4].replace(',', '.'))
+      const kurz = rate / amount
+      kurzyCache[key] = kurz
+      return kurz
+    }
+  } catch { /* fallback */ }
+
+  // Fallback: approximate rates
+  const fallback: Record<string, number> = { EUR: 25.2, USD: 23.1, GBP: 29.5 }
+  return fallback[mena] ?? 1
+}
+
+async function matchByCard(
   t: Record<string, unknown>,
   f: Record<string, unknown>
-): boolean {
+): Promise<boolean> {
   if (t.typ !== 'Platba kartou') return false
   const zprava = String(t.zprava || '').toUpperCase()
   const dodavatel = String(f.dodavatel || '').toUpperCase()
@@ -37,14 +67,30 @@ function matchByCard(
   )
   if (!supplierMatch) return false
 
-  // Amount must match exactly
-  if (Math.abs(Math.abs(Number(t.castka)) - Number(f.castka_s_dph)) >= 1) return false
+  // Amount match — handle EUR/USD faktury vs CZK bank transactions
+  const fCastka = Number(f.castka_s_dph)
+  const tCastka = Math.abs(Number(t.castka))
+  const fMena = String(f.mena || 'CZK')
+  const tMena = String(t.mena || 'CZK')
 
-  // Date within 2 days (card charged day before/after invoice)
+  let amountMatch = false
+  if (fMena === tMena) {
+    amountMatch = Math.abs(tCastka - fCastka) < 1
+  } else if (fMena !== 'CZK' && tMena === 'CZK') {
+    // Faktura in EUR/USD, transaction in CZK — convert via ČNB rate
+    const tDate = String(t.datum || '').split('T')[0]
+    const kurz = await getKurz(fMena, tDate)
+    const fCzkEquiv = fCastka * kurz
+    // Allow 2% tolerance for exchange rate differences
+    amountMatch = Math.abs(tCastka - fCzkEquiv) / fCzkEquiv < 0.02
+  }
+  if (!amountMatch) return false
+
+  // Date within 5 days (EUR invoices may have bigger date gap)
   const fDate = String(f.datum_splatnosti || f.datum_vystaveni || '').split('T')[0]
   const tDate = String(t.datum || '').split('T')[0]
   if (!fDate || !tDate) return false
-  if (daysDiff(fDate, tDate) > 2) return false
+  if (daysDiff(fDate, tDate) > 5) return false
 
   return true
 }
@@ -192,7 +238,8 @@ export async function POST() {
   const cardTranakce = transakce.filter(t => t.typ === 'Platba kartou')
 
   for (const f of [...nova, ...schvalena]) {
-    const match = cardTranakce.find(t => matchByCard(t, f))
+    const matchResults = await Promise.all(cardTranakce.map(t => matchByCard(t, f)))
+    const match = cardTranakce.find((_, i) => matchResults[i])
     if (!match) continue
 
     const fakturaId = f.id as number

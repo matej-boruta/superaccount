@@ -231,7 +231,7 @@ export async function POST() {
                 'Content-Type': 'application/json',
                 Prefer: 'return=minimal',
               },
-              body: JSON.stringify(faktura),
+              body: JSON.stringify({ ...faktura, gmail_message_id: undefined, email_predmet: undefined, email_id: msgId, predmet: subject.substring(0, 200) }),
             })
             accountResult.imported++
           }
