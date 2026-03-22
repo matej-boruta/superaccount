@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 
 type Faktura = {
   id: number
@@ -48,13 +48,18 @@ function fmt(n: number, mena: string) {
   return new Intl.NumberFormat('cs-CZ', { style: 'currency', currency: mena || 'CZK', maximumFractionDigits: 0 }).format(n)
 }
 
-function fmtDate(d: string) {
+function fmtDate(d: string | null | undefined) {
   if (!d) return '—'
-  return new Date(d).toLocaleDateString('cs-CZ', { day: 'numeric', month: 'short', year: 'numeric' })
+  const parts = d.split('T')[0].split('-')
+  if (parts.length !== 3) return '—'
+  const year = parseInt(parts[0])
+  if (year < 2000 || year > 2100) return '—'
+  const date = new Date(year, parseInt(parts[1]) - 1, parseInt(parts[2]))
+  return date.toLocaleDateString('cs-CZ', { day: 'numeric', month: 'short', year: 'numeric' })
 }
 
-type Tab = 'nova' | 'schvalena' | 'zaplacena' | 'zamitnuta' | 'vse'
-type Section = 'faktury' | 'transakce'
+type Tab = 'nova' | 'schvalena' | 'zaplacena' | 'zamitnuta' | 'vse' | 'sparovane' | 'nesparovane'
+type Section = 'faktury'
 type TFilter = 'vse' | 'nesparovano' | 'sparovano'
 
 const TABS = [
@@ -62,6 +67,8 @@ const TABS = [
   { key: 'schvalena' as Tab, label: 'Čekající platby' },
   { key: 'zaplacena' as Tab, label: 'Zaplacené' },
   { key: 'zamitnuta' as Tab, label: 'Zamítnuté' },
+  { key: 'sparovane' as Tab, label: 'Spárované' },
+  { key: 'nesparovane' as Tab, label: 'Nespárované' },
   { key: 'vse' as Tab, label: 'Vše' },
 ]
 
@@ -77,42 +84,41 @@ function dayLabel(d: string): string | null {
   return null
 }
 
-function findMatch(faktura: Faktura, transakce: Transakce[]): Transakce | null {
-  const nespar = transakce.filter(t => t.stav === 'nesparovano')
-  if (nespar.length === 0) return null
+type MatchCandidate = { t: Transakce; score: number; reasons: string[] }
 
-  type Candidate = { t: Transakce; score: number }
-  const candidates: Candidate[] = []
+function scoreCandidate(faktura: Faktura, t: Transakce): MatchCandidate {
+  let score = 0
+  const reasons: string[] = []
+  const amtDiff = Math.abs(Math.abs(t.castka) - faktura.castka_s_dph) / (faktura.castka_s_dph || 1)
+  const vsMatch = !!(faktura.variabilni_symbol && t.variabilni_symbol === faktura.variabilni_symbol)
+  const nameInZprava = !!(faktura.dodavatel && t.zprava?.toLowerCase().includes(faktura.dodavatel.split(' ')[0].toLowerCase()))
+  const daysDiff = faktura.datum_splatnosti && t.datum
+    ? Math.abs((new Date(t.datum).getTime() - new Date(faktura.datum_splatnosti).getTime()) / 86400000)
+    : 999
 
-  for (const t of nespar) {
-    let score = 0
-    const amtDiff = Math.abs(Math.abs(t.castka) - faktura.castka_s_dph) / (faktura.castka_s_dph || 1)
-    const vsMatch = faktura.variabilni_symbol && t.variabilni_symbol === faktura.variabilni_symbol
-    const nameInZprava = faktura.dodavatel && t.zprava?.toLowerCase().includes(faktura.dodavatel.split(' ')[0].toLowerCase())
-    const daysDiff = faktura.datum_splatnosti && t.datum
-      ? Math.abs((new Date(t.datum).getTime() - new Date(faktura.datum_splatnosti).getTime()) / 86400000)
-      : 999
+  if (vsMatch) { score += 50; reasons.push('VS ✓') }
+  if (amtDiff < 0.01) { score += 40; reasons.push('částka ✓') }
+  else if (amtDiff < 0.05) { score += 25; reasons.push('částka ≈') }
+  else if (amtDiff < 0.15) { score += 10; reasons.push('částka ~') }
+  if (nameInZprava) { score += 15; reasons.push('název ✓') }
+  if (daysDiff <= 7) { score += 10; reasons.push('datum ✓') }
+  else if (daysDiff <= 30) { score += 5; reasons.push('datum ~') }
 
-    if (vsMatch && amtDiff < 0.05) score = 100  // perfect
-    else if (vsMatch) score = 70
-    else if (nameInZprava && amtDiff < 0.15) score = 60
-    else if (amtDiff < 0.05 && daysDiff <= 45) score = 40  // amount match only — max 45 days apart
-    else if (amtDiff < 0.10 && daysDiff <= 30) score = 20
-
-    if (score > 0) candidates.push({ t, score })
-  }
-
-  if (candidates.length === 0) return null
-  return candidates.sort((a, b) => b.score - a.score)[0].t
+  return { t, score, reasons }
 }
 
-function matchLabel(faktura: Faktura, t: Transakce): string {
-  const amtDiff = Math.abs(Math.abs(t.castka) - faktura.castka_s_dph) / (faktura.castka_s_dph || 1)
-  const vsMatch = faktura.variabilni_symbol && t.variabilni_symbol === faktura.variabilni_symbol
-  if (vsMatch && amtDiff < 0.05) return 'VS+částka'
-  if (vsMatch) return 'VS'
-  if (amtDiff < 0.05) return '≈částka'
-  return '≈'
+function findTopMatches(faktura: Faktura, transakce: Transakce[], n = 3): MatchCandidate[] {
+  const nespar = transakce.filter(t => t.stav === 'nesparovano')
+  return nespar
+    .map(t => scoreCandidate(faktura, t))
+    .filter(c => c.score >= 40)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, n)
+}
+
+function findMatch(faktura: Faktura, transakce: Transakce[]): Transakce | null {
+  const top = findTopMatches(faktura, transakce, 1)
+  return top[0]?.t ?? null
 }
 
 export default function Home() {
@@ -212,11 +218,7 @@ export default function Home() {
   useEffect(() => { load() }, [])
 
   useEffect(() => {
-    if (section === 'transakce') loadTransakce(faktury)
-  }, [section])
-
-  useEffect(() => {
-    if (tab === 'schvalena') loadTransakce(faktury)
+    if (tab === 'schvalena' || tab === 'sparovane' || tab === 'nesparovane') loadTransakce(faktury)
   }, [tab])
 
   const [selectedSchvalena, setSelectedSchvalena] = useState<Set<number>>(new Set())
@@ -237,6 +239,17 @@ export default function Home() {
       body: JSON.stringify(kategorieId ? { kategorie_id: kategorieId } : {}),
     })
     await load()
+    setProcessing(false)
+  }
+
+  const zrusitZaplaceni = async (id: number) => {
+    setProcessing(true)
+    await fetch('/api/zrusit-zaplaceni', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fakturaId: id }),
+    })
+    await loadTransakce()
     setProcessing(false)
   }
 
@@ -288,7 +301,8 @@ export default function Home() {
   }
 
   // ===== FAKTURY computed =====
-  const filtered = tab === 'vse' ? faktury : faktury.filter(f => f.stav === tab)
+  const isTransakceTab = tab === 'sparovane' || tab === 'nesparovane'
+  const filtered = tab === 'vse' ? faktury : isTransakceTab ? [] : faktury.filter(f => f.stav === tab)
 
   // For schvalena tab: sort by datum_platby ascending
   const filteredSorted = tab === 'schvalena'
@@ -381,7 +395,6 @@ export default function Home() {
 
   const SECTIONS: { key: Section; label: string }[] = [
     { key: 'faktury', label: 'Faktury' },
-    { key: 'transakce', label: 'Transakce' },
   ]
 
   return (
@@ -447,7 +460,11 @@ export default function Home() {
                   >
                     {t.label}
                     {t.key !== 'vse' && (
-                      <span className="ml-1.5 text-[11px] text-gray-400">{count(t.key)}</span>
+                      <span className="ml-1.5 text-[11px] text-gray-400">
+                        {t.key === 'sparovane' ? transakce.filter(tx => tx.stav === 'sparovano').length
+                          : t.key === 'nesparovane' ? transakce.filter(tx => tx.stav === 'nesparovano').length
+                          : count(t.key)}
+                      </span>
                     )}
                   </button>
                 ))}
@@ -483,7 +500,7 @@ export default function Home() {
                     disabled={processing}
                     className="px-4 py-1.5 text-[13px] font-medium text-white bg-[#0071e3] rounded-[10px] hover:bg-[#0077ed] disabled:opacity-40 transition-colors"
                   >
-                    {processing ? 'Zpracovávám…' : `Schválit a zaplatit ${selected.size}`}
+                    {processing ? 'Zpracovávám…' : `Schválit ${selected.size}`}
                   </button>
                 </div>
               )}
@@ -547,13 +564,11 @@ export default function Home() {
                         )}
                       </th>
                       <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Dodavatel</th>
-                      <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Číslo faktury</th>
+                      <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Faktura / VS</th>
                       <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Splatnost</th>
-                      <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Platba</th>
-                      <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">VS</th>
                       <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Kategorie</th>
                       <th className="text-right px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Částka</th>
-                      <th className="px-4 py-3 w-44"></th>
+                      <th className="px-4 py-3 w-48"></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -563,11 +578,14 @@ export default function Home() {
                       const isSoon = dl === 'Zítra' || (dl !== null && dl.startsWith('Za'))
                       const effectiveKategorieId = kategorieOverride.get(f.id) ?? f.kategorie_id ?? undefined
                       const kat = kategorieList.find(k => k.id === effectiveKategorieId)
+                      const suggestion = f.stav === 'schvalena' ? findMatch(f, transakce) : null
+                      const pairedT = transakce.find(t => t.faktura_id === f.id && t.stav === 'sparovano')
+                      const showPicker = activePicker === f.id
                       return (
+                        <Fragment key={f.id}>
                         <tr
-                          key={f.id}
                           onClick={() => f.stav === 'nova' && toggle(f.id)}
-                          className={`${i < filteredSorted.length - 1 ? 'border-b border-gray-50' : ''} transition-colors ${
+                          className={`${i < filteredSorted.length - 1 || showPicker ? 'border-b border-gray-50' : ''} transition-colors ${
                             selected.has(f.id) ? 'bg-blue-50/60' : 'hover:bg-[#f9f9f9]'
                           } ${f.stav === 'nova' ? 'cursor-pointer' : ''} text-sm`}
                         >
@@ -589,40 +607,39 @@ export default function Home() {
                               />
                             )}
                           </td>
+                          {/* col: Dodavatel */}
                           <td className="px-4 py-2.5">
                             <div className="text-[13px] font-medium text-gray-900">{f.dodavatel}</div>
                             <div className="text-[11px] text-gray-400">IČO {f.ico}</div>
                           </td>
-                          <td className="px-4 py-2.5 text-[13px] text-gray-600">{f.cislo_faktury}</td>
-                          <td className="px-4 py-2.5 text-[13px] text-gray-600">{fmtDate(f.datum_splatnosti)}</td>
+                          {/* col: Faktura / VS */}
                           <td className="px-4 py-2.5">
-                            {f.datum_platby ? (
-                              <div className="flex flex-col gap-0.5">
-                                <span className="text-[13px] text-gray-800">{fmtDate(f.datum_platby)}</span>
-                                {dl && (
-                                  <span className={`inline-flex w-fit px-2 py-0.5 rounded-full text-[10px] font-semibold ${
-                                    isUrgent ? 'bg-red-100 text-red-700' :
-                                    isSoon ? 'bg-orange-100 text-orange-700' :
-                                    'bg-gray-100 text-gray-500'
-                                  }`}>
-                                    {dl}
-                                  </span>
-                                )}
-                              </div>
-                            ) : (
-                              <span className="text-[13px] text-gray-400">—</span>
+                            <div className="text-[13px] text-gray-700">{f.cislo_faktury || '—'}</div>
+                            {f.variabilni_symbol && (
+                              <div className="text-[11px] font-mono text-gray-400 mt-0.5">VS {f.variabilni_symbol}</div>
                             )}
                           </td>
+                          {/* col: Splatnost */}
                           <td className="px-4 py-2.5">
-                            {f.variabilni_symbol ? (
-                              <span className="font-mono text-[12px] text-gray-700 bg-gray-100 px-2 py-0.5 rounded">{f.variabilni_symbol}</span>
-                            ) : (
-                              <span className="text-[13px] text-gray-400">—</span>
-                            )}
+                            {(() => {
+                              const actualPayDate = pairedT?.datum ?? f.datum_platby ?? null
+                              const onTime = actualPayDate && f.datum_splatnosti
+                                ? new Date(actualPayDate) <= new Date(f.datum_splatnosti) : null
+                              return (
+                                <div>
+                                  <div className="text-[13px] text-gray-700">{fmtDate(f.datum_splatnosti)}</div>
+                                  {actualPayDate && (
+                                    <div className={`text-[11px] mt-0.5 ${onTime === false ? 'text-red-500' : 'text-gray-400'}`}>
+                                      pl. {fmtDate(actualPayDate)}{onTime === false ? ' !' : ''}
+                                    </div>
+                                  )}
+                                </div>
+                              )
+                            })()}
                           </td>
-                          {/* Kategorie column */}
+                          {/* col: Kategorie */}
                           <td className="px-4 py-2.5" onClick={e => e.stopPropagation()}>
-                            {kategorieList.length > 0 ? (
+                            {f.stav === 'nova' && kategorieList.length > 0 ? (
                               <select
                                 value={effectiveKategorieId ?? ''}
                                 onChange={e => {
@@ -632,9 +649,7 @@ export default function Home() {
                                   setKategorieOverride(next)
                                 }}
                                 className={`text-[11px] rounded-lg px-2 py-1 border outline-none cursor-pointer max-w-[130px] ${
-                                  kat
-                                    ? 'bg-purple-50 border-purple-200 text-purple-800 font-medium'
-                                    : 'bg-gray-50 border-gray-200 text-gray-400'
+                                  kat ? 'bg-purple-50 border-purple-200 text-purple-800 font-medium' : 'bg-gray-50 border-gray-200 text-gray-400'
                                 }`}
                               >
                                 <option value="">— kategorie —</option>
@@ -643,331 +658,214 @@ export default function Home() {
                                 ))}
                               </select>
                             ) : kat ? (
-                              <span className="text-[11px] px-2 py-1 rounded-lg bg-purple-50 text-purple-700 font-medium">{kat.l1} / {kat.l2}</span>
-                            ) : null}
+                              <span className="text-[11px] px-2 py-0.5 rounded-lg bg-purple-50 text-purple-700 font-medium">{kat.l1} / {kat.l2}</span>
+                            ) : (
+                              <span className="text-[12px] text-gray-400">—</span>
+                            )}
                           </td>
+                          {/* col: Částka */}
                           <td className="px-4 py-2.5 text-right">
-                            <div className="text-[13px] font-semibold text-gray-900">{fmt(f.castka_s_dph, f.mena)}</div>
-                            <div className="text-[11px] text-gray-400">bez DPH {fmt(f.castka_bez_dph, f.mena)}</div>
+                            <div className="text-[13px] font-semibold text-gray-900">{fmt(Number(f.castka_s_dph), f.mena)}</div>
+                            {f.stav !== 'schvalena' && (
+                              <div className="text-[11px] text-gray-400">bez DPH {fmt(f.castka_bez_dph, f.mena)}</div>
+                            )}
                           </td>
+                          {/* col: Actions */}
                           <td className="px-4 py-2.5" onClick={e => e.stopPropagation()}>
-                            {f.stav === 'nova' && (
-                              <div className="flex gap-2 justify-end">
-                                <button
-                                  onClick={() => action([f.id], 'zamítnout')}
-                                  disabled={processing}
-                                  className="px-3 py-1.5 text-[12px] font-medium text-red-600 bg-red-50 rounded-[8px] hover:bg-red-100 disabled:opacity-40"
-                                >
+                            <div className="flex items-center gap-2 justify-end">
+                              {f.stav === 'nova' && (<>
+                                <button onClick={() => action([f.id], 'zamítnout')} disabled={processing}
+                                  className="px-3 py-1.5 text-[12px] font-medium text-red-600 bg-red-50 rounded-[8px] hover:bg-red-100 disabled:opacity-40">
                                   Zamítnout
                                 </button>
-                                <button
-                                  onClick={() => schvalitAZaplatit(f.id, kategorieOverride.get(f.id) ?? f.kategorie_id ?? undefined)}
-                                  disabled={processing}
-                                  className="px-3 py-1.5 text-[12px] font-medium text-white bg-[#0071e3] rounded-[8px] hover:bg-[#0077ed] disabled:opacity-40 whitespace-nowrap"
-                                >
-                                  Schválit a zaplatit
+                                <button onClick={() => schvalitAZaplatit(f.id, kategorieOverride.get(f.id) ?? f.kategorie_id ?? undefined)} disabled={processing}
+                                  className="px-3 py-1.5 text-[12px] font-medium text-white bg-[#0071e3] rounded-[8px] hover:bg-[#0077ed] disabled:opacity-40 whitespace-nowrap">
+                                  Schválit
                                 </button>
-                              </div>
-                            )}
-                            {f.stav === 'schvalena' && (
-                              <div className="flex items-center gap-2 justify-end">
-                                {f.datum_platby && (
-                                  <span className="text-[11px] font-medium text-blue-700 bg-blue-50 px-2 py-1 rounded-full whitespace-nowrap">
-                                    {fmtDate(f.datum_platby)}
-                                  </span>
-                                )}
-                                <button
-                                  onClick={() => zrusitSchvaleni([f.id])}
-                                  disabled={processing}
-                                  className="px-2.5 py-1 text-[12px] font-medium text-gray-500 bg-gray-100 rounded-[7px] hover:bg-red-50 hover:text-red-600 disabled:opacity-40 transition-colors whitespace-nowrap"
-                                >
+                              </>)}
+                              {f.stav === 'schvalena' && (<>
+                                <button onClick={() => setActivePicker(showPicker ? null : f.id)}
+                                  className="px-2.5 py-1 text-[12px] font-medium text-[#0071e3] bg-blue-50 rounded-[7px] hover:bg-blue-100 whitespace-nowrap">
+                                  {showPicker ? 'Zavřít' : '···'}
+                                </button>
+                                <button onClick={() => zrusitSchvaleni([f.id])} disabled={processing}
+                                  className="px-2.5 py-1 text-[12px] font-medium text-gray-500 bg-gray-100 rounded-[7px] hover:bg-red-50 hover:text-red-600 disabled:opacity-40 transition-colors whitespace-nowrap">
                                   Zrušit
                                 </button>
-                              </div>
-                            )}
-                            {f.stav === 'zaplacena' && (
-                              <div className="flex items-center gap-2">
-                                <span className="inline-flex px-2.5 py-1 rounded-full text-[11px] font-semibold bg-green-50 text-green-700">
-                                  Zaplaceno
-                                </span>
-                                {!f.zauctovano_platba ? (
-                                  <button
-                                    onClick={() => zauctovat(f.id)}
-                                    disabled={processing}
-                                    className="px-2.5 py-1 text-[12px] font-medium text-purple-700 bg-purple-50 rounded-[7px] hover:bg-purple-100 disabled:opacity-40 transition-colors whitespace-nowrap"
-                                  >
-                                    Zaúčtovat do ABRA
-                                  </button>
-                                ) : (
-                                  <span className="inline-flex px-2.5 py-1 rounded-full text-[11px] font-semibold bg-gray-50 text-gray-400">
-                                    Zaúčtováno
-                                  </span>
-                                )}
-                              </div>
-                            )}
-                            {f.stav === 'zamitnuta' && (
-                              <span className="inline-flex px-2.5 py-1 rounded-full text-[11px] font-semibold bg-red-50 text-red-600">
-                                Zamítnuto
-                              </span>
-                            )}
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-
-            {/* ===== PÁROVÁNÍ (inline v záložce Čekající platby) ===== */}
-            {tab === 'schvalena' && (
-              <div className="mt-6">
-                <div className="flex items-center gap-2 mb-3">
-                  <span className="text-[13px] font-semibold text-gray-700">Párování</span>
-                  {schvalenaUnpaired.length > 0 && (
-                    <span className="inline-flex items-center justify-center px-2 py-0.5 text-[11px] font-bold text-white bg-[#0071e3] rounded-full">
-                      {schvalenaUnpaired.length}
-                    </span>
-                  )}
-                </div>
-                {transakceLoading ? (
-                  <div className="text-center py-10 text-[13px] text-gray-400">Načítám…</div>
-                ) : schvalenaUnpaired.length === 0 ? (
-                  <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] text-center py-10">
-                    <div className="text-[13px] text-gray-400">
-                      {faktury.filter(f => f.stav === 'schvalena').length === 0
-                        ? 'Nejsou žádné schválené faktury k párování'
-                        : 'Všechny schválené faktury jsou spárovány'}
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center gap-3">
-                        <span className="text-[13px] text-gray-400">{schvalenaUnpaired.length} faktur čeká</span>
-                        {exactMatches.length > 0 && (
-                          <button onClick={sparovatExact} disabled={processing}
-                            className="flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium text-green-700 bg-green-50 rounded-[8px] hover:bg-green-100 disabled:opacity-40">
-                            <span>✓</span> Spárovat {exactMatches.length} shod VS+částka
-                          </button>
-                        )}
-                      </div>
-                      {selectedPairs.size > 0 && (
-                        <div className="flex items-center gap-3 bg-white rounded-2xl px-4 py-2 shadow-sm border border-black/[0.06]">
-                          <span className="text-[13px] text-gray-600"><span className="font-semibold text-gray-900">{selectedPairs.size}</span> párů</span>
-                          <div className="w-px h-4 bg-gray-200" />
-                          <button onClick={sparovatVybrané} disabled={processing}
-                            className="px-3 py-1 text-[13px] font-medium text-white bg-[#0071e3] rounded-[8px] hover:bg-[#0077ed] disabled:opacity-40">
-                            {processing ? 'Zpracovávám…' : `Spárovat ${selectedPairs.size}`}
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                    <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-hidden">
-                      <table className="w-full">
-                        <thead>
-                          <tr className="border-b border-gray-100">
-                            <th className="px-3 py-2.5 w-8">
-                              {withSuggestions.length > 0 && (
-                                <input type="checkbox" checked={allPairsChecked}
-                                  ref={el => { if (el) el.indeterminate = somePairsChecked && !allPairsChecked }}
-                                  onChange={toggleAllPairs}
-                                  className="w-4 h-4 rounded accent-[#0071e3] cursor-pointer" />
+                              </>)}
+                              {f.stav === 'zaplacena' && (<>
+                                <span className="inline-flex px-2.5 py-1 rounded-full text-[11px] font-semibold bg-green-50 text-green-700">Zaplaceno</span>
+                                <button onClick={() => zrusitZaplaceni(f.id)} disabled={processing}
+                                  className="px-2.5 py-1 text-[12px] font-medium text-gray-500 bg-gray-100 rounded-[7px] hover:bg-red-50 hover:text-red-600 disabled:opacity-40 transition-colors whitespace-nowrap">
+                                  Zrušit
+                                </button>
+                              </>)}
+                              {f.stav === 'zamitnuta' && (
+                                <span className="inline-flex px-2.5 py-1 rounded-full text-[11px] font-semibold bg-red-50 text-red-600">Zamítnuto</span>
                               )}
-                            </th>
-                            <th className="text-left px-3 py-2.5 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Faktura</th>
-                            <th className="text-right px-3 py-2.5 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Částka</th>
-                            <th className="px-2 py-2.5 w-6"></th>
-                            <th className="text-left px-3 py-2.5 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Transakce</th>
-                            <th className="text-right px-3 py-2.5 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Částka</th>
-                            <th className="px-3 py-2.5 w-[180px]"></th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {schvalenaUnpaired.map((f, i) => {
-                            const suggestion = findMatch(f, transakce)
-                            const showPicker = activePicker === f.id
-                            const isChecked = selectedPairs.has(f.id)
-                            const togglePair = () => {
-                              if (!suggestion) return
-                              const next = new Map(selectedPairs)
-                              isChecked ? next.delete(f.id) : next.set(f.id, suggestion.id)
-                              setSelectedPairs(next)
-                            }
-                            return (
-                              <>
-                                <tr key={f.id}
-                                  className={`${i < schvalenaUnpaired.length - 1 || showPicker ? 'border-b border-gray-50' : ''} transition-colors ${isChecked ? 'bg-blue-50/40' : 'hover:bg-[#f9f9f9]'}`}>
-                                  <td className="px-3 py-2.5">
-                                    {suggestion && (
-                                      <input type="checkbox" checked={isChecked} onChange={togglePair}
-                                        className="w-4 h-4 rounded accent-[#0071e3] cursor-pointer" />
-                                    )}
-                                  </td>
-                                  <td className="px-3 py-2.5">
-                                    <div className="text-[13px] font-medium text-gray-900">{f.dodavatel}</div>
-                                    <div className="text-[11px] text-gray-400">{f.cislo_faktury} · {fmtDate(f.datum_splatnosti)}{f.variabilni_symbol ? ` · VS ${f.variabilni_symbol}` : ''}</div>
-                                  </td>
-                                  <td className="px-3 py-2.5 text-right text-[13px] font-semibold text-gray-900 tabular-nums whitespace-nowrap">
-                                    {fmt(f.castka_s_dph, f.mena)}
-                                  </td>
-                                  <td className="px-1 py-2.5 text-center text-gray-300 text-[11px]">↔</td>
-                                  <td className="px-3 py-2.5">
-                                    {suggestion ? (
-                                      <>
-                                        <div className="flex items-center gap-1.5">
-                                          <span className="text-[13px] text-gray-800 line-clamp-1">{suggestion.zprava || '—'}</span>
-                                          <span className={`flex-shrink-0 px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                                            suggestion.variabilni_symbol === f.variabilni_symbol ? 'bg-green-50 text-green-600' : 'bg-blue-50 text-blue-600'
-                                          }`}>
-                                            {matchLabel(f, suggestion)}
-                                          </span>
-                                        </div>
-                                        <div className="text-[11px] text-gray-400">{fmtDate(suggestion.datum)}{suggestion.variabilni_symbol ? ` · VS ${suggestion.variabilni_symbol}` : ''}</div>
-                                      </>
-                                    ) : (
-                                      <span className="text-[12px] text-gray-400 italic">Bez shody</span>
-                                    )}
-                                  </td>
-                                  <td className={`px-3 py-2.5 text-right text-[13px] font-semibold tabular-nums whitespace-nowrap ${suggestion ? (suggestion.castka < 0 ? 'text-red-600' : 'text-green-700') : 'text-gray-300'}`}>
-                                    {suggestion ? fmt(suggestion.castka, suggestion.mena) : '—'}
-                                  </td>
-                                  <td className="px-3 py-2.5">
-                                    <div className="flex items-center gap-1.5 justify-end">
-                                      {suggestion && (
-                                        <button onClick={() => sparovat(f.id, suggestion.id)} disabled={processing}
-                                          className="px-2.5 py-1 text-[12px] font-medium text-white bg-[#0071e3] rounded-[7px] hover:bg-[#0077ed] disabled:opacity-40">
-                                          Potvrdit
-                                        </button>
-                                      )}
-                                      <button onClick={() => setActivePicker(showPicker ? null : f.id)}
-                                        className="px-2.5 py-1 text-[12px] font-medium text-[#0071e3] bg-blue-50 rounded-[7px] hover:bg-blue-100">
-                                        {showPicker ? 'Zavřít' : '···'}
-                                      </button>
-                                      <button onClick={() => setSkipped(s => new Set([...s, f.id]))}
-                                        className="px-2.5 py-1 text-[12px] text-gray-400 hover:text-gray-600">
-                                        ×
-                                      </button>
-                                    </div>
-                                  </td>
-                                </tr>
-                                {showPicker && (
-                                  <tr key={`picker-${f.id}`} className="border-b border-gray-50 bg-gray-50/60">
-                                    <td colSpan={7} className="px-4 py-3">
-                                      <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Vybrat transakci ({nesparTransakce.length})</div>
-                                      <div className="max-h-48 overflow-y-auto space-y-0.5">
-                                        {nesparTransakce.map(t => (
-                                          <button key={t.id} onClick={() => sparovat(f.id, t.id)} disabled={processing}
-                                            className="w-full text-left px-3 py-2 rounded-lg hover:bg-white transition-colors flex items-center justify-between gap-4 disabled:opacity-40">
-                                            <div className="min-w-0 flex-1">
-                                              <span className="text-[13px] text-gray-800 line-clamp-1">{t.zprava || '—'}</span>
-                                              <span className="text-[11px] text-gray-400 ml-2">{fmtDate(t.datum)}{t.variabilni_symbol ? ` · VS ${t.variabilni_symbol}` : ''}</span>
-                                            </div>
-                                            <span className={`text-[13px] font-semibold flex-shrink-0 ${t.castka < 0 ? 'text-red-600' : 'text-green-700'}`}>
-                                              {fmt(t.castka, t.mena)}
-                                            </span>
-                                          </button>
-                                        ))}
-                                      </div>
-                                    </td>
-                                  </tr>
-                                )}
-                              </>
-                            )
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  </>
-                )}
-              </div>
-            )}
-          </>
-        )}
-
-        {/* ===== TRANSAKCE ===== */}
-        {section === 'transakce' && (
-          <>
-            <div className="flex items-center justify-between mb-5">
-              <div className="flex gap-1 bg-black/[0.05] p-1 rounded-xl w-fit">
-                {([
-                  { key: 'vse' as TFilter, label: 'Vše', n: transakce.length },
-                  { key: 'nesparovano' as TFilter, label: 'Nespárované', n: transakce.filter(t => t.stav === 'nesparovano').length },
-                  { key: 'sparovano' as TFilter, label: 'Spárované', n: transakce.filter(t => t.stav === 'sparovano').length },
-                ]).map(item => (
-                  <button
-                    key={item.key}
-                    onClick={() => setTFilter(item.key)}
-                    className={`px-4 py-1.5 rounded-[10px] text-[13px] font-medium transition-all ${
-                      tFilter === item.key ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'
-                    }`}
-                  >
-                    {item.label}
-                    <span className="ml-1.5 text-[11px] text-gray-400">{item.n}</span>
-                  </button>
-                ))}
-              </div>
-              <span className="text-[13px] text-gray-400">{filteredT.length} pohybů</span>
-            </div>
-
-            {transakceLoading ? (
-              <div className="text-center py-20 text-[13px] text-gray-400">Načítám…</div>
-            ) : filteredT.length === 0 ? (
-              <div className="text-center py-20 text-[13px] text-gray-400">Žádné transakce</div>
-            ) : (
-              <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-hidden">
-                <table className="w-full">
-                  <thead>
-                    <tr className="border-b border-gray-100">
-                      <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Datum</th>
-                      <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Popis</th>
-                      <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Typ</th>
-                      <th className="text-right px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Částka</th>
-                      <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">VS</th>
-                      <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Stav</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredT.map((t, i) => {
-                      const pairedF = t.faktura_id ? faktury.find(f => f.id === t.faktura_id) : null
-                      return (
-                        <tr
-                          key={t.id}
-                          className={`${i < filteredT.length - 1 ? 'border-b border-gray-50' : ''} hover:bg-[#f9f9f9] transition-colors`}
-                        >
-                          <td className="px-4 py-3.5 text-[13px] text-gray-600 whitespace-nowrap">{fmtDate(t.datum)}</td>
-                          <td className="px-4 py-3.5 max-w-[280px]">
-                            <div className="text-[13px] text-gray-800 line-clamp-1">{t.zprava || '—'}</div>
-                            {t.protiucet && <div className="text-[11px] text-gray-400 mt-0.5 font-mono">{t.protiucet}</div>}
-                          </td>
-                          <td className="px-4 py-3.5 text-[12px] text-gray-500 whitespace-nowrap">{t.typ}</td>
-                          <td className={`px-4 py-3.5 text-right text-[14px] font-semibold tabular-nums ${t.castka < 0 ? 'text-red-600' : 'text-green-700'}`}>
-                            {fmt(t.castka, t.mena)}
-                          </td>
-                          <td className="px-4 py-3.5 text-[12px] text-gray-500 font-mono">{t.variabilni_symbol || '—'}</td>
-                          <td className="px-4 py-3.5">
-                            {t.stav === 'sparovano' ? (
-                              <div>
-                                <span className="inline-flex px-2.5 py-1 rounded-full text-[11px] font-medium bg-green-50 text-green-700">
-                                  Spárováno
-                                </span>
-                                {pairedF && (
-                                  <div className="text-[11px] text-gray-400 mt-1 line-clamp-1">{pairedF.dodavatel}</div>
-                                )}
-                              </div>
-                            ) : (
-                              <span className="inline-flex px-2.5 py-1 rounded-full text-[11px] font-medium bg-gray-100 text-gray-500">
-                                Nespárováno
-                              </span>
-                            )}
+                            </div>
                           </td>
                         </tr>
+                        {/* Sub-řádek: navrhovaná platba (schvalena) — 7 cols aligned */}
+                        {f.stav === 'schvalena' && suggestion && !showPicker && (() => {
+                          const vsOk = !!f.variabilni_symbol && suggestion.variabilni_symbol === f.variabilni_symbol
+                          const amtOk = Math.abs(Math.abs(suggestion.castka) - Number(f.castka_s_dph)) < 1
+                          return (
+                            <tr className="border-b border-blue-100/60 bg-blue-50/25">
+                              <td className="pl-4 pr-0 py-2 text-blue-400 text-[11px]">↳</td>
+                              {/* Dodavatel col: zpráva platby */}
+                              <td className="px-4 py-2 text-[12px] text-gray-500 line-clamp-1 max-w-[180px]">
+                                {suggestion.zprava || suggestion.protiucet || '—'}
+                              </td>
+                              {/* Faktura/VS col: TX VS (srovnej s FA VS výše) */}
+                              <td className="px-4 py-2">
+                                <span className={`text-[12px] font-mono ${vsOk ? 'text-green-600 font-semibold' : 'text-gray-500'}`}>
+                                  VS {suggestion.variabilni_symbol || '—'}
+                                </span>
+                                {vsOk && <span className="ml-1 text-[11px] text-green-600">✓</span>}
+                                {!vsOk && f.variabilni_symbol && suggestion.variabilni_symbol && (
+                                  <span className="ml-1 text-[11px] text-orange-500">≠</span>
+                                )}
+                              </td>
+                              {/* Splatnost col: TX datum (srovnej s datem faktury výše) */}
+                              <td className="px-4 py-2 text-[12px] text-gray-500">{fmtDate(suggestion.datum)}</td>
+                              {/* Kategorie col: prázdné */}
+                              <td></td>
+                              {/* Částka col: TX částka (srovnej s FA částkou výše) */}
+                              <td className="px-4 py-2 text-right">
+                                <span className={`text-[13px] font-semibold ${amtOk ? 'text-green-600' : 'text-orange-500'}`}>
+                                  {fmt(Math.abs(suggestion.castka), suggestion.mena)}
+                                  {amtOk && <span className="ml-1 text-[11px]">✓</span>}
+                                </span>
+                              </td>
+                              {/* Actions col: Spárovat */}
+                              <td className="px-4 py-2 text-right" onClick={e => e.stopPropagation()}>
+                                <button onClick={() => sparovat(f.id, suggestion.id)} disabled={processing}
+                                  className="px-3 py-1.5 text-[12px] font-medium text-white bg-[#0071e3] rounded-[7px] hover:bg-[#0077ed] disabled:opacity-40 whitespace-nowrap">
+                                  Spárovat
+                                </button>
+                              </td>
+                            </tr>
+                          )
+                        })()}
+                        {/* Sub-řádek: spárovaná transakce (zaplacena) — 7 cols aligned */}
+                        {f.stav === 'zaplacena' && pairedT && (() => {
+                          const vsOk = !!f.variabilni_symbol && pairedT.variabilni_symbol === f.variabilni_symbol
+                          const amtOk = Math.abs(Math.abs(pairedT.castka) - Number(f.castka_s_dph)) < 1
+                          return (
+                            <tr className="border-b border-green-100/60 bg-green-50/20">
+                              <td className="pl-4 pr-0 py-2 text-green-500 text-[11px]">↳</td>
+                              <td className="px-4 py-2 text-[12px] text-gray-500 line-clamp-1 max-w-[180px]">
+                                {pairedT.zprava || pairedT.protiucet || '—'}
+                              </td>
+                              <td className="px-4 py-2">
+                                <span className={`text-[12px] font-mono ${vsOk ? 'text-green-600 font-semibold' : 'text-gray-500'}`}>
+                                  VS {pairedT.variabilni_symbol || '—'}
+                                </span>
+                                {vsOk && <span className="ml-1 text-[11px] text-green-600">✓</span>}
+                              </td>
+                              <td className="px-4 py-2 text-[12px] text-gray-500">{fmtDate(pairedT.datum)}</td>
+                              <td></td>
+                              <td className="px-4 py-2 text-right">
+                                <span className={`text-[13px] font-semibold ${amtOk ? 'text-green-600' : 'text-orange-500'}`}>
+                                  {fmt(Math.abs(pairedT.castka), pairedT.mena)}
+                                  {amtOk && <span className="ml-1 text-[11px]">✓</span>}
+                                </span>
+                              </td>
+                              <td></td>
+                            </tr>
+                          )
+                        })()}
+                        {f.stav === 'schvalena' && showPicker && (() => {
+                          const topMatches = findTopMatches(f, transakce)
+                          return (
+                            <tr className="border-b border-gray-50 bg-gray-50/50">
+                              <td colSpan={7} className="px-6 py-3">
+                                {topMatches.length === 0 ? (
+                                  <div className="text-[12px] text-gray-400 py-1">Žádná odpovídající platba — čekáme na příchod transakce z banky.</div>
+                                ) : (
+                                  <div className="space-y-1.5">
+                                    <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Navrhované platby</div>
+                                    {topMatches.map((c, idx) => (
+                                      <button key={c.t.id} onClick={() => sparovat(f.id, c.t.id)} disabled={processing}
+                                        className={`w-full text-left px-3 py-2.5 rounded-xl transition-colors flex items-center justify-between gap-4 disabled:opacity-40 ${
+                                          idx === 0 ? 'bg-blue-50 border border-blue-200 hover:bg-blue-100' : 'bg-white border border-gray-100 hover:bg-gray-50'
+                                        }`}>
+                                        <div className="min-w-0 flex-1">
+                                          <div className="flex items-center gap-2 mb-0.5">
+                                            {idx === 0 && <span className="text-[10px] font-bold text-blue-600 bg-blue-100 px-1.5 py-0.5 rounded">Nejlepší shoda</span>}
+                                            <span className="flex gap-1">
+                                              {c.reasons.map(r => (
+                                                <span key={r} className="text-[10px] font-medium text-green-700 bg-green-50 px-1.5 py-0.5 rounded">{r}</span>
+                                              ))}
+                                            </span>
+                                          </div>
+                                          <div className="text-[13px] text-gray-800 line-clamp-1">{c.t.zprava || '—'}</div>
+                                          <div className="text-[11px] text-gray-400">{fmtDate(c.t.datum)}{c.t.variabilni_symbol ? ` · VS ${c.t.variabilni_symbol}` : ''}</div>
+                                        </div>
+                                        <span className={`text-[13px] font-semibold flex-shrink-0 ${c.t.castka < 0 ? 'text-red-600' : 'text-green-700'}`}>
+                                          {fmt(c.t.castka, c.t.mena)}
+                                        </span>
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          )
+                        })()}
+                        </Fragment>
                       )
                     })}
                   </tbody>
                 </table>
               </div>
             )}
+
+            {/* ===== TRANSAKCE ZÁLOŽKY (Spárované / Nespárované) ===== */}
+            {isTransakceTab && (() => {
+              const tList = transakce.filter(t => tab === 'sparovane' ? t.stav === 'sparovano' : t.stav === 'nesparovano')
+              return transakceLoading ? (
+                <div className="text-center py-20 text-[13px] text-gray-400">Načítám…</div>
+              ) : tList.length === 0 ? (
+                <div className="text-center py-20 text-[13px] text-gray-400">Žádné transakce</div>
+              ) : (
+                <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-hidden">
+                  <table className="w-full">
+                    <thead>
+                      <tr className="border-b border-gray-100">
+                        <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Datum</th>
+                        <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Popis</th>
+                        <th className="text-right px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Částka</th>
+                        <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">VS</th>
+                        {tab === 'sparovane' && <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Faktura</th>}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {tList.map((t, i) => {
+                        const pairedF = t.faktura_id ? faktury.find(f => f.id === t.faktura_id) : null
+                        return (
+                          <tr key={t.id} className={`${i < tList.length - 1 ? 'border-b border-gray-50' : ''} hover:bg-[#f9f9f9] transition-colors`}>
+                            <td className="px-4 py-3 text-[13px] text-gray-600 whitespace-nowrap">{fmtDate(t.datum)}</td>
+                            <td className="px-4 py-3 max-w-[300px]">
+                              <div className="text-[13px] text-gray-800 line-clamp-1">{t.zprava || '—'}</div>
+                              {t.protiucet && <div className="text-[11px] text-gray-400 font-mono">{t.protiucet}</div>}
+                            </td>
+                            <td className={`px-4 py-3 text-right text-[13px] font-semibold tabular-nums ${t.castka < 0 ? 'text-red-600' : 'text-green-700'}`}>
+                              {fmt(t.castka, t.mena)}
+                            </td>
+                            <td className="px-4 py-3 text-[12px] text-gray-500 font-mono">{t.variabilni_symbol || '—'}</td>
+                            {tab === 'sparovane' && (
+                              <td className="px-4 py-3 text-[12px] text-gray-500">{pairedF ? pairedF.dodavatel : '—'}</td>
+                            )}
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )
+            })()}
           </>
         )}
 

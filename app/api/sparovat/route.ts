@@ -17,89 +17,90 @@ const SB_HEADERS = {
 export async function POST(req: Request) {
   const { fakturaId, transakceId } = await req.json()
 
-  // 1. Mark transakce as paired
+  // 1. Mark transakce as paired in Supabase
   await fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}`, {
     method: 'PATCH',
     headers: SB_HEADERS,
     body: JSON.stringify({ stav: 'sparovano', faktura_id: fakturaId }),
   })
 
-  // 2. Mark faktura as zaplacena
+  // 2. Mark faktura as zaplacena in Supabase
   await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}`, {
     method: 'PATCH',
     headers: SB_HEADERS,
     body: JSON.stringify({ stav: 'zaplacena' }),
   })
 
-  // 3. Auto-zaúčtovat do ABRA (non-blocking — chyba neblokuje párování)
+  // 3. Zaúčtovat do ABRA (non-blocking)
   let abraResult: { ok: boolean; banka_id?: string; error?: string } = { ok: false }
   try {
-    const fRes = await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}&select=*`, {
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
-    })
+    // Load faktura + transakce data
+    const [fRes, tRes] = await Promise.all([
+      fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}&select=*`, {
+        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+      }),
+      fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}&select=*`, {
+        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+      }),
+    ])
     const [f] = await fRes.json()
-
-    const tRes = await fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}&select=*`, {
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
-    })
     const [t] = await tRes.json()
+    if (!f) throw new Error('Faktura nenalezena v Supabase')
 
-    if (f) {
-      const abraKod = `FP-${fakturaId}-${new Date().getFullYear()}`
-      const abraFaRes = await fetch(`${ABRA_URL}/faktura-prijata.json?kod=${abraKod}`, {
-        headers: { Authorization: ABRA_AUTH },
+    const abraKod = `FP-${fakturaId}-${new Date().getFullYear()}`
+    const abraFaRes = await fetch(`${ABRA_URL}/faktura-prijata/(kod='${abraKod}').json`, {
+      headers: { Authorization: ABRA_AUTH },
+    })
+    const abraFaData = await abraFaRes.json()
+    const abraFa = abraFaData?.winstrom?.['faktura-prijata']?.[0]
+
+    if (!abraFa?.id) {
+      abraResult = { ok: false, error: 'Faktura nenalezena v ABRA' }
+    } else {
+      const datPlatby = t?.datum
+        ? t.datum.split('T')[0]
+        : (f.datum_platby ? f.datum_platby.split('T')[0] : new Date().toISOString().split('T')[0])
+      const castka = Number(f.castka_s_dph)
+      const mena = f.mena || 'CZK'
+
+      // Create banka record paired with faktura-prijata via uhrada
+      const bankaRes = await fetch(`${ABRA_URL}/banka.json`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: ABRA_AUTH },
+        body: JSON.stringify({
+          winstrom: {
+            banka: [{
+              typDokl: 'code:STANDARD',
+              banka: 'code:BANKOVNÍ ÚČET',
+              typPohybuK: 'typPohybu.vydej',
+              varSym: f.variabilni_symbol || '',
+              datVyst: datPlatby,
+              datUcto: datPlatby,
+              popis: `Platba ${abraKod} - ${f.dodavatel}`,
+              mena: `code:${mena}`,
+              sumOsv: castka,
+              primUcet: 'code:221001',
+              protiUcet: 'code:321001',
+              ...(abraFa.firma ? { firma: abraFa.firma } : {}),
+              uhrada: [{ dokladFaktPrij: { id: abraFa.id }, castka }],
+            }],
+          },
+        }),
       })
-      const abraFaData = await abraFaRes.json()
-      const abraFa = abraFaData?.winstrom?.['faktura-prijata']?.[0]
+      const bankaData = await bankaRes.json()
+      const bankaOk = bankaData?.winstrom?.success === 'true'
+      const bankaId = bankaData?.winstrom?.results?.[0]?.id
+      const bankaErr = bankaData?.winstrom?.results?.[0]?.errors?.[0]?.message
 
-      if (abraFa?.id) {
-        const datPlatby = t?.datum
-          ? t.datum.split('T')[0]
-          : (f.datum_platby ? f.datum_platby.split('T')[0] : new Date().toISOString().split('T')[0])
-        const castka = Number(f.castka_s_dph)
-        const mena = f.mena || 'CZK'
-
-        const bankaRes = await fetch(`${ABRA_URL}/banka.json`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: ABRA_AUTH },
-          body: JSON.stringify({
-            winstrom: {
-              banka: [{
-                typDokl: 'code:STANDARD',
-                banka: 'code:BANKOVNÍ ÚČET',
-                ...(abraFa.firma ? { firma: abraFa.firma } : {}),
-                varSym: f.variabilni_symbol || '',
-                datVyst: datPlatby,
-                popis: `Platba ${abraKod} - ${f.dodavatel}`,
-                castka: -castka,
-                mena: `code:${mena}`,
-                polozkyBanky: [{
-                  typPolozkyK: 'typPolozky.uhradaFaktury',
-                  faktura: `id:${abraFa.id}`,
-                  castka,
-                }],
-              }],
-            },
-          }),
+      if (bankaOk) {
+        await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}`, {
+          method: 'PATCH',
+          headers: SB_HEADERS,
+          body: JSON.stringify({ zauctovano_platba: true }),
         })
-
-        const bankaData = await bankaRes.json()
-        const bankaSuccess = bankaData?.winstrom?.success === 'true'
-        const bankaId = bankaData?.winstrom?.results?.[0]?.id
-        const bankaErr = bankaData?.winstrom?.results?.[0]?.errors?.[0]?.message
-
-        if (bankaSuccess) {
-          await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}`, {
-            method: 'PATCH',
-            headers: SB_HEADERS,
-            body: JSON.stringify({ zauctovano_platba: true }),
-          })
-          abraResult = { ok: true, banka_id: bankaId }
-        } else {
-          abraResult = { ok: false, error: bankaErr }
-        }
+        abraResult = { ok: true, banka_id: bankaId }
       } else {
-        abraResult = { ok: false, error: 'Faktura nenalezena v ABRA' }
+        abraResult = { ok: false, error: bankaErr || 'Chyba při vytváření banka záznamu v ABRA' }
       }
     }
   } catch (e) {
