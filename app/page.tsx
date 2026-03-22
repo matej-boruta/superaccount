@@ -714,8 +714,8 @@ export default function Home() {
                             <tr className="border-b border-blue-100/60 bg-blue-50/25">
                               <td className="pl-4 pr-0 py-2 text-blue-400 text-[11px]">↳</td>
                               {/* Dodavatel col: zpráva platby */}
-                              <td className="px-4 py-2 text-[12px] text-gray-500 line-clamp-1 max-w-[180px]">
-                                {suggestion.zprava || suggestion.protiucet || '—'}
+                              <td className="px-4 py-2 max-w-0">
+                                <div className="text-[12px] text-gray-500 truncate">{(suggestion.zprava || suggestion.protiucet || '—').substring(0, 60)}</div>
                               </td>
                               {/* Faktura/VS col: TX VS (srovnej s FA VS výše) */}
                               <td className="px-4 py-2">
@@ -755,8 +755,8 @@ export default function Home() {
                           return (
                             <tr className="border-b border-green-100/60 bg-green-50/20">
                               <td className="pl-4 pr-0 py-2 text-green-500 text-[11px]">↳</td>
-                              <td className="px-4 py-2 text-[12px] text-gray-500 line-clamp-1 max-w-[180px]">
-                                {pairedT.zprava || pairedT.protiucet || '—'}
+                              <td className="px-4 py-2 max-w-0">
+                                <div className="text-[12px] text-gray-500 truncate">{(pairedT.zprava || pairedT.protiucet || '—').substring(0, 60)}</div>
                               </td>
                               <td className="px-4 py-2">
                                 <span className={`text-[12px] font-mono ${vsOk ? 'text-green-600 font-semibold' : 'text-gray-500'}`}>
