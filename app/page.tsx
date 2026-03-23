@@ -347,6 +347,18 @@ export default function Home() {
     .filter(f => f.datum_platby)
     .sort((a, b) => new Date(a.datum_platby!).getTime() - new Date(b.datum_platby!).getTime())[0]
 
+  // ===== MANAŽERSKÉ METRIKY =====
+  const todayMs = new Date().setHours(0, 0, 0, 0)
+  const poSplatnostiFaktury = faktury.filter(f =>
+    (f.stav === 'nova' || f.stav === 'schvalena') &&
+    f.datum_splatnosti && new Date(f.datum_splatnosti).setHours(0,0,0,0) < todayMs
+  )
+  const poSplatnostiCelkem = poSplatnostiFaktury.reduce((s, f) => s + Number(f.castka_s_dph), 0)
+  const zavazkyFaktury = faktury.filter(f => f.stav === 'nova' || f.stav === 'schvalena')
+  const zavazkySum = zavazkyFaktury.reduce((s, f) => s + Number(f.castka_s_dph), 0)
+  const nesparovaneSum = transakce.filter(t => t.stav === 'nesparovano').reduce((s, t) => s + Math.abs(Number(t.castka)), 0)
+  const zaplacenaSum = faktury.filter(f => f.stav === 'zaplacena').reduce((s, f) => s + Number(f.castka_s_dph), 0)
+
   // ===== PÁROVÁNÍ =====
   const pairedFakturaIds = new Set(transakce.filter(t => t.faktura_id !== null).map(t => t.faktura_id!))
   const schvalenaUnpaired = faktury.filter(f => f.stav === 'schvalena' && !skipped.has(f.id))
@@ -438,15 +450,72 @@ export default function Home() {
         {/* ===== FAKTURY ===== */}
         {section === 'faktury' && (
           <>
-            {count('nova') > 0 && (
-              <div className="bg-white rounded-2xl px-6 py-5 mb-6 shadow-sm border border-black/[0.06]">
-                <p className="text-[13px] text-gray-500 mb-1">Čeká na schválení</p>
-                <div className="flex items-baseline gap-3">
-                  <span className="text-3xl font-semibold text-gray-900 tracking-tight">{count('nova')} faktur</span>
-                  <span className="text-[15px] text-gray-500">celkem {fmt(totalNova, 'CZK')}</span>
+            {/* ── Manažerský dashboard ── */}
+            <div className="grid grid-cols-3 gap-4 mb-6">
+
+              {/* Ke schválení */}
+              <div className="bg-white rounded-2xl px-5 py-4 shadow-sm border border-black/[0.06]">
+                <p className="text-[12px] text-gray-400 uppercase tracking-wide mb-2">Ke schválení</p>
+                <div className="flex items-baseline gap-2">
+                  <span className="text-2xl font-semibold text-gray-900">{count('nova')}</span>
+                  <span className="text-[13px] text-gray-400">faktur</span>
                 </div>
+                <p className="text-[13px] text-gray-500 mt-1">{fmt(totalNova, 'CZK')}</p>
               </div>
-            )}
+
+              {/* Čekající platby */}
+              <div className="bg-white rounded-2xl px-5 py-4 shadow-sm border border-black/[0.06]">
+                <p className="text-[12px] text-gray-400 uppercase tracking-wide mb-2">Čekající platby</p>
+                <div className="flex items-baseline gap-2">
+                  <span className="text-2xl font-semibold text-gray-900">{count('schvalena')}</span>
+                  <span className="text-[13px] text-gray-400">faktur</span>
+                </div>
+                <p className="text-[13px] text-gray-500 mt-1">{fmt(schvalenaCelkem, 'CZK')}
+                  {nejblizsiPlatba && <span className="text-gray-400"> · pl. {fmtDate(nejblizsiPlatba.datum_platby)}</span>}
+                </p>
+              </div>
+
+              {/* Po splatnosti */}
+              <div className={`rounded-2xl px-5 py-4 shadow-sm border ${poSplatnostiFaktury.length > 0 ? 'bg-red-50 border-red-100' : 'bg-white border-black/[0.06]'}`}>
+                <p className={`text-[12px] uppercase tracking-wide mb-2 ${poSplatnostiFaktury.length > 0 ? 'text-red-400' : 'text-gray-400'}`}>Po splatnosti</p>
+                <div className="flex items-baseline gap-2">
+                  <span className={`text-2xl font-semibold ${poSplatnostiFaktury.length > 0 ? 'text-red-600' : 'text-gray-900'}`}>{poSplatnostiFaktury.length}</span>
+                  <span className="text-[13px] text-gray-400">faktur</span>
+                </div>
+                <p className={`text-[13px] mt-1 ${poSplatnostiFaktury.length > 0 ? 'text-red-500' : 'text-gray-500'}`}>{fmt(poSplatnostiCelkem, 'CZK')}</p>
+              </div>
+
+              {/* Závazky celkem */}
+              <div className="bg-white rounded-2xl px-5 py-4 shadow-sm border border-black/[0.06]">
+                <p className="text-[12px] text-gray-400 uppercase tracking-wide mb-2">Závazky celkem</p>
+                <div className="flex items-baseline gap-2">
+                  <span className="text-2xl font-semibold text-gray-900">{zavazkyFaktury.length}</span>
+                  <span className="text-[13px] text-gray-400">faktur</span>
+                </div>
+                <p className="text-[13px] text-gray-500 mt-1">{fmt(zavazkySum, 'CZK')}</p>
+              </div>
+
+              {/* Nespárované transakce */}
+              <div className="bg-white rounded-2xl px-5 py-4 shadow-sm border border-black/[0.06]">
+                <p className="text-[12px] text-gray-400 uppercase tracking-wide mb-2">Nespárované transakce</p>
+                <div className="flex items-baseline gap-2">
+                  <span className="text-2xl font-semibold text-gray-900">{transakce.filter(t => t.stav === 'nesparovano').length}</span>
+                  <span className="text-[13px] text-gray-400">pohybů</span>
+                </div>
+                <p className="text-[13px] text-gray-500 mt-1">{fmt(nesparovaneSum, 'CZK')}</p>
+              </div>
+
+              {/* Zaplaceno celkem */}
+              <div className="bg-white rounded-2xl px-5 py-4 shadow-sm border border-black/[0.06]">
+                <p className="text-[12px] text-gray-400 uppercase tracking-wide mb-2">Zaplaceno celkem</p>
+                <div className="flex items-baseline gap-2">
+                  <span className="text-2xl font-semibold text-gray-900">{count('zaplacena')}</span>
+                  <span className="text-[13px] text-gray-400">faktur</span>
+                </div>
+                <p className="text-[13px] text-gray-500 mt-1">{fmt(zaplacenaSum, 'CZK')}</p>
+              </div>
+
+            </div>
 
             <div className="flex items-center justify-between mb-5">
               <div className="flex gap-1 bg-black/[0.05] p-1 rounded-xl w-fit">
