@@ -373,6 +373,10 @@ export default function Home() {
   const nejblizsiPlatba = schvalenaFaktury
     .filter(f => f.datum_platby)
     .sort((a, b) => new Date(a.datum_platby!).getTime() - new Date(b.datum_platby!).getTime())[0]
+  const todayStr = new Date().toDateString()
+  const overdueSchvalena = schvalenaFaktury.filter(f =>
+    f.datum_splatnosti && new Date(f.datum_splatnosti) < new Date(todayStr)
+  ).length
 
   // ===== MANAŽERSKÉ METRIKY =====
   const todayMs = new Date().setHours(0, 0, 0, 0)
@@ -489,6 +493,12 @@ export default function Home() {
         <div className="max-w-6xl mx-auto px-6 h-14 flex items-center justify-between">
           <span className="text-[15px] font-semibold text-gray-900 tracking-tight">SuperAccount</span>
           <div className="flex items-center gap-3">
+            {overdueSchvalena > 0 && (
+              <div className="flex items-center gap-1.5">
+                <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full bg-red-500 text-white text-[11px] font-bold">{overdueSchvalena}</span>
+                <span className="text-[12px] text-red-600 font-medium">po splatnosti</span>
+              </div>
+            )}
             {classifying && (
               <span className="text-[12px] text-gray-400 animate-pulse">Klasifikuji kategorie…</span>
             )}
@@ -505,8 +515,8 @@ export default function Home() {
       <main className="max-w-6xl mx-auto px-6 py-8">
 
         {/* ── Sticky tabs ── */}
-        <div className="sticky top-[52px] z-10 bg-white/90 backdrop-blur-xl border-b border-black/[0.06] -mx-6 px-6 py-3 mb-5 flex items-center justify-between">
-              <div className="flex gap-1 bg-black/[0.05] p-1 rounded-xl w-fit">
+        <div className="sticky top-[52px] z-10 bg-white/90 backdrop-blur-xl border-b border-black/[0.06] -mx-6 px-6 py-2 mb-5 flex items-center justify-between">
+              <div className="flex gap-0.5 bg-black/[0.05] p-1 rounded-xl overflow-x-auto max-w-full">
                 {TABS.map(t => {
                   const cnt = t.key === 'sparovane' ? transakce.filter(tx => tx.stav === 'sparovano').length
                     : t.key === 'nesparovane' ? transakce.filter(tx => tx.stav === 'nesparovano').length
@@ -518,7 +528,7 @@ export default function Home() {
                     <button
                       key={t.key}
                       onClick={() => { setTab(t.key); setSelected(new Set()) }}
-                      className={`relative px-4 py-1.5 rounded-[10px] text-[13px] font-medium transition-all ${
+                      className={`relative whitespace-nowrap px-3 py-1.5 rounded-[10px] text-[12px] font-medium transition-all ${
                         tab === t.key ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'
                       }`}
                     >
@@ -1024,9 +1034,9 @@ export default function Home() {
         )}
 
         {tab === 'pravidla' && (
-          <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-hidden">
+          <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-clip">
             <table className="w-full text-sm">
-              <thead className="sticky top-[105px] z-10 bg-gray-50 border-b border-gray-100">
+              <thead className="bg-gray-50 border-b border-gray-100">
                 <tr>
                   <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Dodavatel (pattern)</th>
                   <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Typ platby</th>
