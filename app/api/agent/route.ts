@@ -112,8 +112,11 @@ async function getPravidlo(dodavatel: string, ico?: string): Promise<Pravidlo | 
     pravidlaCache = Array.isArray(rows) ? rows : []
   }
   const upper = dodavatel.toUpperCase()
-  // Match by dodavatel_pattern (strip %, case-insensitive contains)
-  const byPattern = pravidlaCache.find(r => {
+  // Sort by pattern specificity (longer = more specific) — most specific first
+  const sorted = [...pravidlaCache].sort((a, b) =>
+    String(b.dodavatel_pattern || '').length - String(a.dodavatel_pattern || '').length
+  )
+  const byPattern = sorted.find(r => {
     const p = String(r.dodavatel_pattern || '').replace(/%/g, '').toUpperCase()
     return p && upper.includes(p)
   })

@@ -59,7 +59,18 @@ function fmtDate(d: string | null | undefined) {
 }
 
 type Tab = 'nova' | 'schvalena' | 'zaplacena' | 'zamitnuta' | 'vse' | 'sparovane' | 'nesparovane'
-type Section = 'faktury'
+type Section = 'faktury' | 'pravidla'
+
+type Pravidlo = {
+  id: number
+  dodavatel_pattern: string
+  ico: string | null
+  typ_platby: string | null
+  auto_schvalit: boolean
+  auto_parovat: boolean
+  poznamka: string | null
+  kategorie_id: number | null
+}
 type TFilter = 'vse' | 'nesparovano' | 'sparovano'
 
 const TABS = [
@@ -405,8 +416,23 @@ export default function Home() {
   // ===== TRANSAKCE =====
   const filteredT = tFilter === 'vse' ? transakce : transakce.filter(t => t.stav === tFilter)
 
+  const [pravidla, setPravidla] = useState<Pravidlo[]>([])
+  useEffect(() => {
+    fetch('/api/pravidla').then(r => r.json()).then(d => Array.isArray(d) && setPravidla(d)).catch(() => {})
+  }, [])
+
+  const togglePravidlo = async (id: number, field: 'auto_schvalit' | 'auto_parovat', val: boolean) => {
+    setPravidla(prev => prev.map(p => p.id === id ? { ...p, [field]: val } : p))
+    await fetch('/api/pravidla', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, [field]: val }),
+    })
+  }
+
   const SECTIONS: { key: Section; label: string }[] = [
     { key: 'faktury', label: 'Faktury' },
+    { key: 'pravidla', label: 'Pravidla dodavatelů' },
   ]
 
   return (
@@ -870,6 +896,69 @@ export default function Home() {
               )
             })()}
           </>
+        )}
+
+        {/* ===== PRAVIDLA DODAVATELŮ ===== */}
+        {section === 'pravidla' && (
+          <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="sticky top-[52px] z-10 bg-gray-50 border-b border-gray-100">
+                <tr>
+                  <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Dodavatel (pattern)</th>
+                  <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Typ platby</th>
+                  <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Keyword (zpráva)</th>
+                  <th className="px-5 py-3 text-center text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Auto schválit</th>
+                  <th className="px-5 py-3 text-center text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Auto párovat</th>
+                  <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Poznámka</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pravidla.map((p, i) => {
+                  const keyword = p.poznamka?.match(/^keyword:(.+)/)?.[1]?.trim() ?? null
+                  const poznamka = keyword ? null : p.poznamka
+                  return (
+                    <tr key={p.id} className={`border-b border-gray-50 hover:bg-gray-50/50 ${i % 2 === 0 ? '' : 'bg-gray-50/20'}`}>
+                      <td className="px-5 py-3">
+                        <div className="text-[13px] font-mono font-medium text-gray-900">{p.dodavatel_pattern}</div>
+                        {p.ico && <div className="text-[11px] text-gray-400 mt-0.5">IČO {p.ico}</div>}
+                      </td>
+                      <td className="px-5 py-3">
+                        <span className={`inline-flex px-2 py-0.5 rounded-full text-[11px] font-medium ${
+                          p.typ_platby === 'karta' ? 'bg-blue-50 text-blue-700' :
+                          p.typ_platby === 'prevod' ? 'bg-purple-50 text-purple-700' :
+                          'bg-gray-100 text-gray-500'
+                        }`}>
+                          {p.typ_platby ?? '—'}
+                        </span>
+                      </td>
+                      <td className="px-5 py-3">
+                        {keyword ? (
+                          <span className="text-[12px] font-mono text-orange-600 bg-orange-50 px-2 py-0.5 rounded">{keyword}</span>
+                        ) : <span className="text-gray-400">—</span>}
+                      </td>
+                      <td className="px-5 py-3 text-center">
+                        <button
+                          onClick={() => togglePravidlo(p.id, 'auto_schvalit', !p.auto_schvalit)}
+                          className={`w-10 h-5 rounded-full transition-colors relative ${p.auto_schvalit ? 'bg-green-500' : 'bg-gray-200'}`}
+                        >
+                          <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${p.auto_schvalit ? 'translate-x-5' : 'translate-x-0.5'}`} />
+                        </button>
+                      </td>
+                      <td className="px-5 py-3 text-center">
+                        <button
+                          onClick={() => togglePravidlo(p.id, 'auto_parovat', !p.auto_parovat)}
+                          className={`w-10 h-5 rounded-full transition-colors relative ${p.auto_parovat ? 'bg-green-500' : 'bg-gray-200'}`}
+                        >
+                          <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${p.auto_parovat ? 'translate-x-5' : 'translate-x-0.5'}`} />
+                        </button>
+                      </td>
+                      <td className="px-5 py-3 text-[12px] text-gray-400 max-w-[200px] truncate">{poznamka ?? '—'}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
         )}
 
       </main>
