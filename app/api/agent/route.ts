@@ -47,15 +47,13 @@ type Faktura = Record<string, unknown>
 type Transakce = Record<string, unknown>
 type Pravidlo = {
   id: number
-  dodavatel: string
+  dodavatel_pattern: string
   ico: string | null
   kategorie_id: number | null
   typ_platby: string | null
-  parovat_keyword: string | null
   auto_schvalit: boolean
   auto_parovat: boolean
-  poznamka: string | null
-  pocet_faktur: number
+  poznamka: string | null  // "keyword:GOOGLE*WORKSPACE" → zprava keyword pro párování
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -107,17 +105,21 @@ async function sbPost(path: string, body: Record<string, unknown>) {
 
 // ── Pravidla ─────────────────────────────────────────────────────────────────
 
+let pravidlaCache: Pravidlo[] | null = null
 async function getPravidlo(dodavatel: string, ico?: string): Promise<Pravidlo | null> {
-  // Match by exact dodavatel name
-  const rows = await sbGet(`dodavatel_pravidla?dodavatel=eq.${encodeURIComponent(dodavatel)}&limit=1`)
-  if (Array.isArray(rows) && rows.length > 0) return rows[0]
-
-  // Match by ICO if provided
-  if (ico) {
-    const byIco = await sbGet(`dodavatel_pravidla?ico=eq.${encodeURIComponent(ico)}&limit=1`)
-    if (Array.isArray(byIco) && byIco.length > 0) return byIco[0]
+  if (!pravidlaCache) {
+    const rows = await sbGet('dodavatel_pravidla?select=*')
+    pravidlaCache = Array.isArray(rows) ? rows : []
   }
-
+  const upper = dodavatel.toUpperCase()
+  // Match by dodavatel_pattern (strip %, case-insensitive contains)
+  const byPattern = pravidlaCache.find(r => {
+    const p = String(r.dodavatel_pattern || '').replace(/%/g, '').toUpperCase()
+    return p && upper.includes(p)
+  })
+  if (byPattern) return byPattern
+  // Match by ICO
+  if (ico) return pravidlaCache.find(r => r.ico && r.ico === ico) ?? null
   return null
 }
 
@@ -162,16 +164,13 @@ async function learnFromHistory(faktura: Faktura): Promise<Pravidlo | null> {
 
   // Save learned rule
   const newRule = {
-    dodavatel,
+    dodavatel_pattern: dodavatel,
     ico: String(faktura.ico || '') || null,
     kategorie_id: mostCommonKat ?? faktura.kategorie_id ?? null,
     typ_platby: detectedTyp,
-    parovat_keyword: detectedKeyword,
     auto_schvalit: autoSchvalit,
     auto_parovat: autoParovat,
-    poznamka: `Naučeno automaticky z ${history.length} faktur`,
-    pocet_faktur: history.length,
-    aktualizovano_at: new Date().toISOString(),
+    poznamka: detectedKeyword ? `keyword:${detectedKeyword}` : `Naučeno z ${history.length} faktur`,
   }
 
   try {
@@ -183,19 +182,12 @@ async function learnFromHistory(faktura: Faktura): Promise<Pravidlo | null> {
 }
 
 async function updatePravidloStats(pravidloId: number, newKategorieId?: number) {
-  const patch: Record<string, unknown> = {
-    pocet_faktur: 999, // will increment via SQL — use raw increment
-    aktualizovano_at: new Date().toISOString(),
-  }
+  if (!pravidloId) return
+  const patch: Record<string, unknown> = {}
   if (newKategorieId) patch.kategorie_id = newKategorieId
-
-  // Simple increment via select+patch
-  const rows = await sbGet(`dodavatel_pravidla?id=eq.${pravidloId}&select=pocet_faktur`)
-  if (Array.isArray(rows) && rows.length > 0) {
-    patch.pocet_faktur = (Number(rows[0].pocet_faktur) || 0) + 1
+  if (Object.keys(patch).length > 0) {
+    await sbPatch(`dodavatel_pravidla?id=eq.${pravidloId}`, patch)
   }
-
-  await sbPatch(`dodavatel_pravidla?id=eq.${pravidloId}`, patch)
 }
 
 // ── ABRA: create faktura-prijata ──────────────────────────────────────────────
@@ -322,9 +314,12 @@ async function findCardMatch(
   pravidlo: Pravidlo,
   transakce: Transakce[]
 ): Promise<Transakce | null> {
-  if (!pravidlo.parovat_keyword) return null
+  // Keyword je buď z poznamka ("keyword:SLOVO") nebo z dodavatel_pattern
+  const keywordRaw = pravidlo.poznamka?.match(/^keyword:(.+)/)?.[1]?.trim()
+    ?? String(pravidlo.dodavatel_pattern || '').replace(/%/g, '').split(' ')[0]
+  if (!keywordRaw) return null
 
-  const keyword = pravidlo.parovat_keyword.toUpperCase()
+  const keyword = keywordRaw.toUpperCase()
   const fDate = String(faktura.datum_splatnosti || faktura.datum_vystaveni || '').split('T')[0]
   const fCastka = Number(faktura.castka_s_dph)
   const fMena = String(faktura.mena || 'CZK')
