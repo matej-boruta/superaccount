@@ -229,7 +229,14 @@ async function createAbraFP(f: Faktura, alreadyPaid: boolean): Promise<string | 
   }
   const datSplatRaw = String(f.datum_splatnosti || '')
   const datSplatYear = parseInt(datSplatRaw.split('-')[0])
-  if (datSplatYear >= 2020 && datSplatYear <= 2100) body.datSplat = datSplatRaw
+  if (datSplatYear >= 2020 && datSplatYear <= 2100) {
+    body.datSplat = datSplatRaw
+  } else {
+    // ABRA vyžaduje splatnost — fallback: datum vystavení + 14 dní
+    const fallbackDate = new Date(datVyst)
+    fallbackDate.setDate(fallbackDate.getDate() + 14)
+    body.datSplat = fallbackDate.toISOString().split('T')[0]
+  }
   if (alreadyPaid) body.stavUhrK = 'stavUhr.uhrazenoRucne'
 
   const res = await fetch(`${ABRA_URL}/faktura-prijata.json`, {
