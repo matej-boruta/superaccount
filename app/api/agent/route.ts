@@ -384,15 +384,13 @@ export async function POST() {
         const spec = specialMatch[1]
         pravidlo = {
           id: 0,
-          dodavatel: specialMatch[0],
+          dodavatel_pattern: specialMatch[0],
           ico: String(spec.dic || spec.ico || '') || null,
           kategorie_id: null,
           typ_platby: String(spec.platba || 'prevod'),
-          parovat_keyword: specialMatch[0].split(' ')[0].toUpperCase(),
           auto_schvalit: false,
           auto_parovat: spec.platba === 'karta',
-          poznamka: `Ze agent_knowledge: ${specialMatch[0]}`,
-          pocet_faktur: 0,
+          poznamka: `keyword:${specialMatch[0].split(' ')[0].toUpperCase()}`,
         } as Pravidlo
       }
     }
