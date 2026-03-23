@@ -58,8 +58,7 @@ function fmtDate(d: string | null | undefined) {
   return date.toLocaleDateString('cs-CZ', { day: 'numeric', month: 'short', year: 'numeric' })
 }
 
-type Tab = 'nova' | 'schvalena' | 'zaplacena' | 'zamitnuta' | 'vse' | 'sparovane' | 'nesparovane'
-type Section = 'faktury' | 'pravidla'
+type Tab = 'nova' | 'schvalena' | 'zaplacena' | 'zamitnuta' | 'vse' | 'sparovane' | 'nesparovane' | 'vydane' | 'pravidla'
 
 type Pravidlo = {
   id: number
@@ -71,6 +70,22 @@ type Pravidlo = {
   poznamka: string | null
   kategorie_id: number | null
 }
+
+type FakturaVydana = {
+  id: number
+  cislo_faktury: string
+  odberatel: string
+  castka_bez_dph: number
+  dph: number
+  castka_s_dph: number
+  mena: string
+  datum_vystaveni: string
+  datum_splatnosti: string | null
+  variabilni_symbol: string | null
+  stav: string
+  popis: string | null
+  transakce_id: number | null
+}
 type TFilter = 'vse' | 'nesparovano' | 'sparovano'
 
 const TABS = [
@@ -81,6 +96,8 @@ const TABS = [
   { key: 'sparovane' as Tab, label: 'Spárované' },
   { key: 'nesparovane' as Tab, label: 'Nespárované' },
   { key: 'vse' as Tab, label: 'Vše' },
+  { key: 'vydane' as Tab, label: 'Vydané faktury' },
+  { key: 'pravidla' as Tab, label: 'Pravidla dodavatelů' },
 ]
 
 function dayLabel(d: string): string | null {
@@ -143,7 +160,6 @@ export default function Home() {
   const [kategorieOverride, setKategorieOverride] = useState<Map<number, number>>(new Map())
   const [classifying, setClassifying] = useState(false)
 
-  const [section, setSection] = useState<Section>('faktury')
   const [transakce, setTransakce] = useState<Transakce[]>([])
   const [transakceLoading, setTransakceLoading] = useState(false)
   const [tFilter, setTFilter] = useState<TFilter>('vse')
@@ -421,6 +437,41 @@ export default function Home() {
     fetch('/api/pravidla').then(r => r.json()).then(d => Array.isArray(d) && setPravidla(d)).catch(() => {})
   }, [])
 
+  const [vydane, setVydane] = useState<FakturaVydana[]>([])
+  const [vydaneLoading, setVydaneLoading] = useState(false)
+  const [csvImporting, setCsvImporting] = useState(false)
+  const [csvResult, setCsvResult] = useState<string | null>(null)
+
+  const loadVydane = async () => {
+    setVydaneLoading(true)
+    const res = await fetch('/api/vydane')
+    const data = await res.json()
+    if (Array.isArray(data)) setVydane(data)
+    setVydaneLoading(false)
+  }
+
+  useEffect(() => {
+    if (tab === 'vydane') loadVydane()
+  }, [tab])
+
+  const handleCsvImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setCsvImporting(true)
+    setCsvResult(null)
+    const text = await file.text()
+    const res = await fetch('/api/vydane/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: text,
+    })
+    const data = await res.json()
+    setCsvResult(data.error ?? `Nahráno ${data.imported ?? 0} faktur, přeskočeno ${data.skipped ?? 0}`)
+    setCsvImporting(false)
+    await loadVydane()
+    e.target.value = ''
+  }
+
   const togglePravidlo = async (id: number, field: 'auto_schvalit' | 'auto_parovat', val: boolean) => {
     setPravidla(prev => prev.map(p => p.id === id ? { ...p, [field]: val } : p))
     await fetch('/api/pravidla', {
@@ -430,39 +481,19 @@ export default function Home() {
     })
   }
 
-  const SECTIONS: { key: Section; label: string }[] = [
-    { key: 'faktury', label: 'Faktury' },
-    { key: 'pravidla', label: 'Pravidla dodavatelů' },
-  ]
-
   return (
     <div style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", sans-serif' }}
       className="min-h-screen bg-[#f5f5f7]">
 
       <header className="bg-white/80 backdrop-blur-xl border-b border-black/[0.08] sticky top-0 z-10">
         <div className="max-w-6xl mx-auto px-6 h-14 flex items-center justify-between">
-          <div className="flex items-center gap-6">
-            <span className="text-[15px] font-semibold text-gray-900 tracking-tight">SuperAccount</span>
-            <nav className="flex gap-0.5">
-              {SECTIONS.map(s => (
-                <button
-                  key={s.key}
-                  onClick={() => setSection(s.key)}
-                  className={`relative px-3 py-1.5 rounded-lg text-[13px] font-medium transition-colors ${
-                    section === s.key ? 'text-gray-900 bg-black/[0.06]' : 'text-gray-500 hover:text-gray-700'
-                  }`}
-                >
-                  {s.label}
-                </button>
-              ))}
-            </nav>
-          </div>
+          <span className="text-[15px] font-semibold text-gray-900 tracking-tight">SuperAccount</span>
           <div className="flex items-center gap-3">
             {classifying && (
               <span className="text-[12px] text-gray-400 animate-pulse">Klasifikuji kategorie…</span>
             )}
             <button
-              onClick={() => { load(); if (section !== 'faktury') loadTransakce() }}
+              onClick={() => { load(); loadTransakce() }}
               className="text-[13px] text-[#0071e3] hover:text-[#0077ed] font-medium"
             >
               Obnovit
@@ -473,16 +504,14 @@ export default function Home() {
 
       <main className="max-w-6xl mx-auto px-6 py-8">
 
-        {/* ===== FAKTURY ===== */}
-        {section === 'faktury' && (
-          <>
-            {/* ── Sticky tabs ── */}
-            <div className="sticky top-[52px] z-10 bg-white/90 backdrop-blur-xl border-b border-black/[0.06] -mx-6 px-6 py-3 mb-5 flex items-center justify-between">
+        {/* ── Sticky tabs ── */}
+        <div className="sticky top-[52px] z-10 bg-white/90 backdrop-blur-xl border-b border-black/[0.06] -mx-6 px-6 py-3 mb-5 flex items-center justify-between">
               <div className="flex gap-1 bg-black/[0.05] p-1 rounded-xl w-fit">
                 {TABS.map(t => {
                   const cnt = t.key === 'sparovane' ? transakce.filter(tx => tx.stav === 'sparovano').length
                     : t.key === 'nesparovane' ? transakce.filter(tx => tx.stav === 'nesparovano').length
-                    : t.key === 'vse' ? null
+                    : t.key === 'vydane' ? vydane.length || null
+                    : t.key === 'vse' || t.key === 'pravidla' ? null
                     : count(t.key)
                   const showRedBadge = (t.key === 'nova' || t.key === 'nesparovane') && cnt && cnt > 0
                   return (
@@ -559,6 +588,7 @@ export default function Home() {
               )}
             </div>
 
+        {tab !== 'pravidla' && tab !== 'vydane' && (<>
             {/* Čekající platby summary banner */}
             {tab === 'schvalena' && schvalenaFaktury.length > 0 && (
               <div className="bg-blue-50 border border-blue-100 rounded-2xl px-5 py-3.5 mb-4 flex items-center gap-3">
@@ -620,12 +650,16 @@ export default function Home() {
                       const suggestion = f.stav === 'schvalena' ? findMatch(f, transakce) : null
                       const pairedT = transakce.find(t => t.faktura_id === f.id && t.stav === 'sparovano')
                       const showPicker = activePicker === f.id
+                      const isSchvalena = f.stav === 'schvalena'
+                      const isOverdue = isSchvalena && f.datum_splatnosti
+                        ? new Date(f.datum_splatnosti) < new Date(new Date().toDateString())
+                        : false
                       return (
                         <Fragment key={f.id}>
                         <tr
                           onClick={() => f.stav === 'nova' && toggle(f.id)}
                           className={`${i < filteredSorted.length - 1 || showPicker ? 'border-b border-gray-50' : ''} transition-colors ${
-                            selected.has(f.id) ? 'bg-blue-50/60' : 'hover:bg-[#f9f9f9]'
+                            selected.has(f.id) ? 'bg-blue-50/60' : isSchvalena ? 'bg-gray-50/40 hover:bg-gray-100/60' : 'hover:bg-[#f9f9f9]'
                           } ${f.stav === 'nova' ? 'cursor-pointer' : ''} text-sm`}
                         >
                           <td className="px-4 py-2.5" onClick={e => e.stopPropagation()}>
@@ -648,32 +682,38 @@ export default function Home() {
                           </td>
                           {/* col: Dodavatel */}
                           <td className="px-4 py-2.5">
-                            <div className="text-[13px] font-medium text-gray-900">{f.dodavatel}</div>
+                            <div className="flex items-center gap-1.5">
+                              {isOverdue && (
+                                <span className="flex-shrink-0 inline-flex items-center justify-center w-[18px] h-[18px] rounded-full bg-red-500 text-white text-[9px] font-bold">!</span>
+                              )}
+                              <div className={`text-[13px] font-medium ${isSchvalena ? 'text-gray-400' : 'text-gray-900'}`}>{f.dodavatel}</div>
+                            </div>
                             <div className="text-[11px] text-gray-400">IČO {f.ico}</div>
                           </td>
                           {/* col: Faktura / VS */}
                           <td className="px-4 py-2.5">
-                            <div className="text-[13px] text-gray-700">{f.cislo_faktury || '—'}</div>
+                            <div className={`text-[13px] ${isSchvalena ? 'text-gray-400' : 'text-gray-700'}`}>{f.cislo_faktury || '—'}</div>
                             {f.variabilni_symbol && (
                               <div className="text-[11px] font-mono text-gray-400 mt-0.5">VS {f.variabilni_symbol}</div>
                             )}
                           </td>
                           {/* col: Vystavení */}
                           <td className="px-4 py-2.5">
-                            <div className="text-[13px] text-gray-700">{fmtDate(f.datum_vystaveni) || '—'}</div>
+                            <div className={`text-[13px] ${isSchvalena ? 'text-gray-400' : 'text-gray-700'}`}>{fmtDate(f.datum_vystaveni) || '—'}</div>
                           </td>
                           {/* col: Splatnost */}
                           <td className="px-4 py-2.5">
                             {(() => {
-                              const actualPayDate = pairedT?.datum ?? f.datum_platby ?? null
+                              // Pro zaplacené faktury: skutečné datum platby z párované transakce
+                              const actualPayDate = pairedT?.datum ?? null
                               const onTime = actualPayDate && f.datum_splatnosti
                                 ? new Date(actualPayDate) <= new Date(f.datum_splatnosti) : null
                               return (
                                 <div>
-                                  <div className="text-[13px] text-gray-700">{fmtDate(f.datum_splatnosti)}</div>
+                                  <div className={`text-[13px] ${isSchvalena ? 'text-gray-400' : 'text-gray-700'}`}>{fmtDate(f.datum_splatnosti)}</div>
                                   {actualPayDate && (
                                     <div className={`text-[11px] mt-0.5 ${onTime === false ? 'text-red-500' : 'text-gray-400'}`}>
-                                      pl. {fmtDate(actualPayDate)}{onTime === false ? ' !' : ''}
+                                      zaplaceno {fmtDate(actualPayDate)}{onTime === false ? ' !' : ''}
                                     </div>
                                   )}
                                 </div>
@@ -895,28 +935,108 @@ export default function Home() {
                 </div>
               )
             })()}
-          </>
-        )}
+        </>)}
 
         {/* ===== PRAVIDLA DODAVATELŮ ===== */}
-        {section === 'pravidla' && (
+        {/* ===== VYDANÉ FAKTURY ===== */}
+        {tab === 'vydane' && (
+          <div className="space-y-4">
+            {/* Upload CSV */}
+            <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] px-5 py-4 flex items-center gap-4">
+              <div>
+                <div className="text-[13px] font-medium text-gray-900 mb-0.5">Nahrát faktury z CSV</div>
+                <div className="text-[11px] text-gray-400">Sloupce: cislo_faktury, odberatel, castka_bez_dph, dph, castka_s_dph, mena, datum_vystaveni, datum_splatnosti, variabilni_symbol, popis</div>
+              </div>
+              <label className={`ml-auto flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-medium cursor-pointer transition-colors ${csvImporting ? 'bg-gray-100 text-gray-400' : 'bg-[#0071e3] text-white hover:bg-[#0077ed]'}`}>
+                {csvImporting ? 'Nahrávám…' : 'Vybrat CSV'}
+                <input type="file" accept=".csv" className="hidden" onChange={handleCsvImport} disabled={csvImporting} />
+              </label>
+              {csvResult && (
+                <div className="text-[12px] text-gray-500 ml-3">{csvResult}</div>
+              )}
+            </div>
+
+            {/* Tabulka */}
+            {vydaneLoading ? (
+              <div className="text-center py-20 text-[13px] text-gray-400">Načítám…</div>
+            ) : vydane.length === 0 ? (
+              <div className="text-center py-20 text-[13px] text-gray-400">Žádné vydané faktury</div>
+            ) : (
+              <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-clip">
+                <table className="w-full text-sm">
+                  <thead className="sticky top-[105px] z-10 bg-white border-b border-gray-100">
+                    <tr>
+                      <th className="px-4 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Odběratel</th>
+                      <th className="px-4 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Faktura / VS</th>
+                      <th className="px-4 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Vystavení</th>
+                      <th className="px-4 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Splatnost</th>
+                      <th className="px-4 py-3 text-right text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Částka</th>
+                      <th className="px-4 py-3 text-center text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Stav</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {vydane.map((f, i) => {
+                      const isOverdueV = f.stav !== 'zaplacena' && f.datum_splatnosti
+                        ? new Date(f.datum_splatnosti) < new Date(new Date().toDateString())
+                        : false
+                      return (
+                        <tr key={f.id} className={`${i < vydane.length - 1 ? 'border-b border-gray-50' : ''} hover:bg-[#f9f9f9]`}>
+                          <td className="px-4 py-2.5">
+                            <div className="flex items-center gap-1.5">
+                              {isOverdueV && (
+                                <span className="flex-shrink-0 inline-flex items-center justify-center w-[18px] h-[18px] rounded-full bg-red-500 text-white text-[9px] font-bold">!</span>
+                              )}
+                              <div className="text-[13px] font-medium text-gray-900">{f.odberatel}</div>
+                            </div>
+                            {f.popis && <div className="text-[11px] text-gray-400 mt-0.5">{f.popis}</div>}
+                          </td>
+                          <td className="px-4 py-2.5">
+                            <div className="text-[13px] text-gray-700">{f.cislo_faktury}</div>
+                            {f.variabilni_symbol && <div className="text-[11px] font-mono text-gray-400 mt-0.5">VS {f.variabilni_symbol}</div>}
+                          </td>
+                          <td className="px-4 py-2.5">
+                            <div className="text-[13px] text-gray-700">{fmtDate(f.datum_vystaveni)}</div>
+                          </td>
+                          <td className="px-4 py-2.5">
+                            <div className={`text-[13px] ${isOverdueV ? 'text-red-600 font-medium' : 'text-gray-700'}`}>{fmtDate(f.datum_splatnosti)}</div>
+                          </td>
+                          <td className="px-4 py-2.5 text-right">
+                            <div className="text-[13px] font-semibold text-gray-900">{fmt(f.castka_s_dph, f.mena)}</div>
+                            <div className="text-[11px] text-gray-400">bez DPH {fmt(f.castka_bez_dph, f.mena)}</div>
+                          </td>
+                          <td className="px-4 py-2.5 text-center">
+                            <span className={`inline-flex px-2 py-0.5 rounded-full text-[11px] font-medium ${
+                              f.stav === 'zaplacena' ? 'bg-green-50 text-green-700' :
+                              isOverdueV ? 'bg-red-50 text-red-700' :
+                              'bg-yellow-50 text-yellow-700'
+                            }`}>
+                              {f.stav === 'zaplacena' ? 'Zaplacena' : isOverdueV ? 'Po splatnosti' : 'Čekající'}
+                            </span>
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === 'pravidla' && (
           <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-hidden">
             <table className="w-full text-sm">
-              <thead className="sticky top-[52px] z-10 bg-gray-50 border-b border-gray-100">
+              <thead className="sticky top-[105px] z-10 bg-gray-50 border-b border-gray-100">
                 <tr>
                   <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Dodavatel (pattern)</th>
                   <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Typ platby</th>
-                  <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Keyword (zpráva)</th>
                   <th className="px-5 py-3 text-center text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Auto schválit</th>
                   <th className="px-5 py-3 text-center text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Auto párovat</th>
                   <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Poznámka</th>
                 </tr>
               </thead>
               <tbody>
-                {pravidla.map((p, i) => {
-                  const keyword = p.poznamka?.match(/^keyword:(.+)/)?.[1]?.trim() ?? null
-                  const poznamka = keyword ? null : p.poznamka
-                  return (
+                {pravidla.map((p, i) => (
                     <tr key={p.id} className={`border-b border-gray-50 hover:bg-gray-50/50 ${i % 2 === 0 ? '' : 'bg-gray-50/20'}`}>
                       <td className="px-5 py-3">
                         <div className="text-[13px] font-mono font-medium text-gray-900">{p.dodavatel_pattern}</div>
@@ -930,11 +1050,6 @@ export default function Home() {
                         }`}>
                           {p.typ_platby ?? '—'}
                         </span>
-                      </td>
-                      <td className="px-5 py-3">
-                        {keyword ? (
-                          <span className="text-[12px] font-mono text-orange-600 bg-orange-50 px-2 py-0.5 rounded">{keyword}</span>
-                        ) : <span className="text-gray-400">—</span>}
                       </td>
                       <td className="px-5 py-3 text-center">
                         <button
@@ -952,10 +1067,9 @@ export default function Home() {
                           <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${p.auto_parovat ? 'translate-x-5' : 'translate-x-0.5'}`} />
                         </button>
                       </td>
-                      <td className="px-5 py-3 text-[12px] text-gray-400 max-w-[200px] truncate">{poznamka ?? '—'}</td>
+                      <td className="px-5 py-3 text-[12px] text-gray-500">{p.poznamka ?? '—'}</td>
                     </tr>
-                  )
-                })}
+                  ))}
               </tbody>
             </table>
           </div>
