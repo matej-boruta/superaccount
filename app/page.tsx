@@ -740,8 +740,11 @@ export default function Home() {
                           {/* col: Částka */}
                           <td className="px-4 py-2.5 text-right">
                             <div className="text-[13px] font-semibold text-gray-900">{fmt(Number(f.castka_s_dph), f.mena)}</div>
-                            {f.stav !== 'schvalena' && (
-                              <div className="text-[11px] text-gray-400">bez DPH {fmt(f.castka_bez_dph, f.mena)}</div>
+                            <div className="text-[11px] text-gray-400">bez DPH {fmt(f.castka_bez_dph, f.mena)}</div>
+                            {pairedT && (
+                              <div className={`text-[12px] font-semibold mt-0.5 ${Math.abs(Math.abs(pairedT.castka) - Number(f.castka_s_dph)) < 1 ? 'text-green-600' : 'text-orange-500'}`}>
+                                {fmt(Math.abs(pairedT.castka), pairedT.mena)} ✓
+                              </div>
                             )}
                           </td>
                           {/* col: Actions */}
@@ -822,34 +825,17 @@ export default function Home() {
                             </tr>
                           )
                         })()}
-                        {/* Sub-řádek: spárovaná transakce (zaplacena) — 7 cols aligned */}
-                        {f.stav === 'zaplacena' && pairedT && (() => {
-                          const vsOk = !!f.variabilni_symbol && pairedT.variabilni_symbol === f.variabilni_symbol
-                          const amtOk = Math.abs(Math.abs(pairedT.castka) - Number(f.castka_s_dph)) < 1
-                          return (
-                            <tr className="border-b border-green-100/60 bg-green-50/20">
-                              <td className="pl-4 pr-0 py-2 text-green-500 text-[11px]">↳</td>
-                              <td className="px-4 py-2 max-w-0">
-                                <div className="text-[12px] text-gray-500 truncate">{(pairedT.zprava || pairedT.protiucet || '—').substring(0, 60)}</div>
-                              </td>
-                              <td className="px-4 py-2">
-                                <span className={`text-[12px] font-mono ${vsOk ? 'text-green-600 font-semibold' : 'text-gray-500'}`}>
-                                  VS {pairedT.variabilni_symbol || '—'}
-                                </span>
-                                {vsOk && <span className="ml-1 text-[11px] text-green-600">✓</span>}
-                              </td>
-                              <td className="px-4 py-2 text-[12px] text-gray-500">{fmtDate(pairedT.datum)}</td>
-                              <td></td>
-                              <td className="px-4 py-2 text-right">
-                                <span className={`text-[13px] font-semibold ${amtOk ? 'text-green-600' : 'text-orange-500'}`}>
-                                  {fmt(Math.abs(pairedT.castka), pairedT.mena)}
-                                  {amtOk && <span className="ml-1 text-[11px]">✓</span>}
-                                </span>
-                              </td>
-                              <td></td>
-                            </tr>
-                          )
-                        })()}
+                        {/* Sub-řádek: spárovaná transakce (zaplacena) — jen zpráva + datum */}
+                        {f.stav === 'zaplacena' && pairedT && (
+                          <tr className="border-b border-green-100/60 bg-green-50/20">
+                            <td className="pl-4 pr-0 py-1.5 text-green-500 text-[11px]">↳</td>
+                            <td className="px-4 py-1.5 max-w-0" colSpan={3}>
+                              <div className="text-[11px] text-gray-400 truncate">{(pairedT.zprava || pairedT.protiucet || '—').substring(0, 80)}</div>
+                            </td>
+                            <td className="px-4 py-1.5 text-[11px] text-gray-400">{fmtDate(pairedT.datum)}</td>
+                            <td colSpan={2}></td>
+                          </tr>
+                        )}
                         {f.stav === 'schvalena' && showPicker && (() => {
                           const topMatches = findTopMatches(f, transakce)
                           return (
