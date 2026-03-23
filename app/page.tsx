@@ -450,93 +450,36 @@ export default function Home() {
         {/* ===== FAKTURY ===== */}
         {section === 'faktury' && (
           <>
-            {/* ── Manažerský dashboard ── */}
-            <div className="grid grid-cols-3 gap-4 mb-6">
-
-              {/* Ke schválení */}
-              <div className="bg-white rounded-2xl px-5 py-4 shadow-sm border border-black/[0.06]">
-                <p className="text-[12px] text-gray-400 uppercase tracking-wide mb-2">Ke schválení</p>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-2xl font-semibold text-gray-900">{count('nova')}</span>
-                  <span className="text-[13px] text-gray-400">faktur</span>
-                </div>
-                <p className="text-[13px] text-gray-500 mt-1">{fmt(totalNova, 'CZK')}</p>
-              </div>
-
-              {/* Čekající platby */}
-              <div className="bg-white rounded-2xl px-5 py-4 shadow-sm border border-black/[0.06]">
-                <p className="text-[12px] text-gray-400 uppercase tracking-wide mb-2">Čekající platby</p>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-2xl font-semibold text-gray-900">{count('schvalena')}</span>
-                  <span className="text-[13px] text-gray-400">faktur</span>
-                </div>
-                <p className="text-[13px] text-gray-500 mt-1">{fmt(schvalenaCelkem, 'CZK')}
-                  {nejblizsiPlatba && <span className="text-gray-400"> · pl. {fmtDate(nejblizsiPlatba.datum_platby)}</span>}
-                </p>
-              </div>
-
-              {/* Po splatnosti */}
-              <div className={`rounded-2xl px-5 py-4 shadow-sm border ${poSplatnostiFaktury.length > 0 ? 'bg-red-50 border-red-100' : 'bg-white border-black/[0.06]'}`}>
-                <p className={`text-[12px] uppercase tracking-wide mb-2 ${poSplatnostiFaktury.length > 0 ? 'text-red-400' : 'text-gray-400'}`}>Po splatnosti</p>
-                <div className="flex items-baseline gap-2">
-                  <span className={`text-2xl font-semibold ${poSplatnostiFaktury.length > 0 ? 'text-red-600' : 'text-gray-900'}`}>{poSplatnostiFaktury.length}</span>
-                  <span className="text-[13px] text-gray-400">faktur</span>
-                </div>
-                <p className={`text-[13px] mt-1 ${poSplatnostiFaktury.length > 0 ? 'text-red-500' : 'text-gray-500'}`}>{fmt(poSplatnostiCelkem, 'CZK')}</p>
-              </div>
-
-              {/* Závazky celkem */}
-              <div className="bg-white rounded-2xl px-5 py-4 shadow-sm border border-black/[0.06]">
-                <p className="text-[12px] text-gray-400 uppercase tracking-wide mb-2">Závazky celkem</p>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-2xl font-semibold text-gray-900">{zavazkyFaktury.length}</span>
-                  <span className="text-[13px] text-gray-400">faktur</span>
-                </div>
-                <p className="text-[13px] text-gray-500 mt-1">{fmt(zavazkySum, 'CZK')}</p>
-              </div>
-
-              {/* Nespárované transakce */}
-              <div className="bg-white rounded-2xl px-5 py-4 shadow-sm border border-black/[0.06]">
-                <p className="text-[12px] text-gray-400 uppercase tracking-wide mb-2">Nespárované transakce</p>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-2xl font-semibold text-gray-900">{transakce.filter(t => t.stav === 'nesparovano').length}</span>
-                  <span className="text-[13px] text-gray-400">pohybů</span>
-                </div>
-                <p className="text-[13px] text-gray-500 mt-1">{fmt(nesparovaneSum, 'CZK')}</p>
-              </div>
-
-              {/* Zaplaceno celkem */}
-              <div className="bg-white rounded-2xl px-5 py-4 shadow-sm border border-black/[0.06]">
-                <p className="text-[12px] text-gray-400 uppercase tracking-wide mb-2">Zaplaceno celkem</p>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-2xl font-semibold text-gray-900">{count('zaplacena')}</span>
-                  <span className="text-[13px] text-gray-400">faktur</span>
-                </div>
-                <p className="text-[13px] text-gray-500 mt-1">{fmt(zaplacenaSum, 'CZK')}</p>
-              </div>
-
-            </div>
-
-            <div className="flex items-center justify-between mb-5">
+            {/* ── Sticky tabs ── */}
+            <div className="sticky top-[52px] z-10 bg-white/90 backdrop-blur-xl border-b border-black/[0.06] -mx-6 px-6 py-3 mb-5 flex items-center justify-between">
               <div className="flex gap-1 bg-black/[0.05] p-1 rounded-xl w-fit">
-                {TABS.map(t => (
-                  <button
-                    key={t.key}
-                    onClick={() => { setTab(t.key); setSelected(new Set()) }}
-                    className={`px-4 py-1.5 rounded-[10px] text-[13px] font-medium transition-all ${
-                      tab === t.key ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'
-                    }`}
-                  >
-                    {t.label}
-                    {t.key !== 'vse' && (
-                      <span className="ml-1.5 text-[11px] text-gray-400">
-                        {t.key === 'sparovane' ? transakce.filter(tx => tx.stav === 'sparovano').length
-                          : t.key === 'nesparovane' ? transakce.filter(tx => tx.stav === 'nesparovano').length
-                          : count(t.key)}
-                      </span>
-                    )}
-                  </button>
-                ))}
+                {TABS.map(t => {
+                  const cnt = t.key === 'sparovane' ? transakce.filter(tx => tx.stav === 'sparovano').length
+                    : t.key === 'nesparovane' ? transakce.filter(tx => tx.stav === 'nesparovano').length
+                    : t.key === 'vse' ? null
+                    : count(t.key)
+                  const showRedBadge = (t.key === 'nova' || t.key === 'nesparovane') && cnt && cnt > 0
+                  return (
+                    <button
+                      key={t.key}
+                      onClick={() => { setTab(t.key); setSelected(new Set()) }}
+                      className={`relative px-4 py-1.5 rounded-[10px] text-[13px] font-medium transition-all ${
+                        tab === t.key ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                      }`}
+                    >
+                      {t.label}
+                      {cnt !== null && (
+                        showRedBadge ? (
+                          <span className="ml-1.5 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-bold">
+                            {cnt}
+                          </span>
+                        ) : (
+                          <span className="ml-1.5 text-[11px] text-gray-400">{cnt}</span>
+                        )
+                      )}
+                    </button>
+                  )
+                })}
               </div>
 
               {selected.size > 0 && (
@@ -610,7 +553,7 @@ export default function Home() {
             ) : (
               <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-clip">
                 <table className="w-full">
-                  <thead className="sticky top-[57px] z-10 bg-white">
+                  <thead className="sticky top-[105px] z-10 bg-white">
                     <tr className="border-b border-gray-100">
                       <th className="px-4 py-3 w-10">
                         {novaFiltered.length > 0 && tab === 'nova' && (
