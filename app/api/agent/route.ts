@@ -355,6 +355,10 @@ async function findCardMatch(
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 export async function POST() {
+  // Reset caches — pravidla se mění, chceme vždy čerstvá data
+  pravidlaCache = null
+  agentContext = null
+
   // Load agent's knowledge base (APIs, rules, context)
   const ctx = await loadAgentContext()
   const specialniDodavatele = (ctx['kontext']?.['dodavatele_specialni'] ?? {}) as Record<string, Record<string, unknown>>
