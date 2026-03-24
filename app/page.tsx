@@ -163,6 +163,7 @@ export default function Home() {
   const [transakce, setTransakce] = useState<Transakce[]>([])
   const [transakceLoading, setTransakceLoading] = useState(false)
   const [tFilter, setTFilter] = useState<TFilter>('vse')
+  const [dodavatelSearch, setDodavatelSearch] = useState('')
   const [activePicker, setActivePicker] = useState<number | null>(null)
   const [skipped, setSkipped] = useState<Set<number>>(new Set())
   // Map<fakturaId, transakceId> — checked pairs in párování
@@ -329,7 +330,14 @@ export default function Home() {
 
   // ===== FAKTURY computed =====
   const isTransakceTab = tab === 'sparovane' || tab === 'nesparovane'
-  const filtered = tab === 'vse' ? faktury : isTransakceTab ? [] : faktury.filter(f => f.stav === tab)
+  const filtered = (() => {
+    const base = tab === 'vse' ? faktury : isTransakceTab ? [] : faktury.filter(f => f.stav === tab)
+    if (tab === 'zaplacena' && dodavatelSearch.trim()) {
+      const q = dodavatelSearch.trim().toLowerCase()
+      return base.filter(f => f.dodavatel.toLowerCase().includes(q))
+    }
+    return base
+  })()
 
   // For schvalena tab: sort by datum_platby ascending
   const filteredSorted = tab === 'schvalena'
@@ -593,6 +601,23 @@ export default function Home() {
             </div>
 
         {tab !== 'pravidla' && tab !== 'vydane' && (<>
+            {/* Filtr dodavatele pro zaplacené */}
+            {tab === 'zaplacena' && (
+              <div className="mb-4 flex items-center gap-2">
+                <input
+                  type="text"
+                  placeholder="Hledat dodavatele…"
+                  value={dodavatelSearch}
+                  onChange={e => setDodavatelSearch(e.target.value)}
+                  className="w-64 px-3 py-2 text-[13px] rounded-xl border border-black/[0.1] bg-white outline-none focus:border-[#0071e3] placeholder:text-gray-400"
+                />
+                {dodavatelSearch && (
+                  <button onClick={() => setDodavatelSearch('')} className="text-[12px] text-gray-400 hover:text-gray-600">Zrušit</button>
+                )}
+                <span className="text-[12px] text-gray-400">{filteredSorted.length} faktur</span>
+              </div>
+            )}
+
             {/* Čekající platby summary banner */}
             {tab === 'schvalena' && schvalenaFaktury.length > 0 && (
               <div className="bg-blue-50 border border-blue-100 rounded-2xl px-5 py-3.5 mb-4 flex items-center gap-3">
