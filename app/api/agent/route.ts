@@ -325,7 +325,7 @@ async function findCardMatch(
   transakce: Transakce[]
 ): Promise<Transakce | null> {
   // Keyword je buď z poznamka ("keyword:SLOVO") nebo z dodavatel_pattern
-  const keywordRaw = pravidlo.poznamka?.match(/^keyword:(.+)/)?.[1]?.trim()
+  const keywordRaw = pravidlo.poznamka?.match(/(?:^|\n)keyword:([^\n]+)/)?.[1]?.trim()
     ?? String(pravidlo.dodavatel_pattern || '').replace(/%/g, '').split(' ')[0]
   if (!keywordRaw) return null
 
