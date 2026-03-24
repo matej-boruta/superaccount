@@ -114,15 +114,44 @@ function dayLabel(d: string): string | null {
 
 type MatchCandidate = { t: Transakce; score: number; reasons: string[] }
 
+// Klíčová slova známých dodavatelů pro detekci konfliktů v popisu kart. transakcí
+const KNOWN_SUPPLIER_KEYWORDS: Record<string, string[]> = {
+  'google': ['google ads', 'google *ads', 'google cloud', 'google workspace', 'google ireland'],
+  'seznam': ['seznam', 'sklik'],
+  'facebook': ['facebook', 'meta '],
+  'twilio': ['twilio'],
+  'daktela': ['daktela'],
+  'ipex': ['ipex'],
+  'freepik': ['freepik'],
+}
+
 function scoreCandidate(faktura: Faktura, t: Transakce): MatchCandidate {
   let score = 0
   const reasons: string[] = []
   const amtDiff = Math.abs(Math.abs(t.castka) - faktura.castka_s_dph) / (faktura.castka_s_dph || 1)
   const vsMatch = !!(faktura.variabilni_symbol && t.variabilni_symbol === faktura.variabilni_symbol)
-  const nameInZprava = !!(faktura.dodavatel && t.zprava?.toLowerCase().includes(faktura.dodavatel.split(' ')[0].toLowerCase()))
+  const zprava = (t.zprava ?? '').toLowerCase()
+  const dodavatelLower = (faktura.dodavatel ?? '').toLowerCase()
+  const nameInZprava = !!(faktura.dodavatel && zprava.includes(dodavatelLower.split(' ')[0]))
   const daysDiff = faktura.datum_splatnosti && t.datum
     ? Math.abs((new Date(t.datum).getTime() - new Date(faktura.datum_splatnosti).getTime()) / 86400000)
     : 999
+
+  // Negativní signál: zpráva kart. transakce obsahuje jiného dodavatele
+  if (t.typ === 'karta' || (!t.protiucet && t.zprava?.startsWith('Nákup'))) {
+    for (const [key, keywords] of Object.entries(KNOWN_SUPPLIER_KEYWORDS)) {
+      const zpravaMatchesOther = keywords.some(kw => zprava.includes(kw))
+      const fakturaBelongsToThis = dodavatelLower.includes(key) || key === 'google' && dodavatelLower.includes('ireland')
+      if (zpravaMatchesOther && !fakturaBelongsToThis) {
+        // Zpráva jednoznačně ukazuje na jiného dodavatele → diskvalifikovat
+        return { t, score: -100, reasons: [`zpráva=${t.zprava?.slice(0, 20)} ≠ dodavatel`] }
+      }
+    }
+    // Pro kartové transakce: bez VS shody vyžadujeme alespoň shodu jména v zprávě
+    if (!vsMatch && !nameInZprava) {
+      return { t, score: 0, reasons: ['karta bez VS/název'] }
+    }
+  }
 
   if (vsMatch) { score += 50; reasons.push('VS ✓') }
   if (amtDiff < 0.01) { score += 40; reasons.push('částka ✓') }
@@ -218,11 +247,18 @@ export default function Home() {
 
     for (const f of fList.filter(f => f.stav === 'schvalena' && !pairedIds.has(f.id))) {
       if (!f.variabilni_symbol) continue
-      const match = nespar.find(t =>
-        !usedTransakceIds.has(t.id) &&
-        t.variabilni_symbol === f.variabilni_symbol &&
-        Math.abs(Math.abs(t.castka) - f.castka_s_dph) / f.castka_s_dph < 0.05
-      )
+      const match = nespar.find(t => {
+        if (usedTransakceIds.has(t.id)) return false
+        if (t.variabilni_symbol !== f.variabilni_symbol) return false
+        if (Math.abs(Math.abs(t.castka) - f.castka_s_dph) / f.castka_s_dph >= 0.05) return false
+        // Kartové transakce: ověř že zpráva neobsahuje jiného dodavatele
+        const isKarta = t.typ === 'karta' || (!t.protiucet && (t.zprava ?? '').startsWith('Nákup'))
+        if (isKarta) {
+          const c = scoreCandidate(f, t)
+          if (c.score <= 0) return false
+        }
+        return true
+      })
       if (match) {
         autoPairs.push({ fakturaId: f.id, transakceId: match.id })
         usedTransakceIds.add(match.id)
