@@ -493,12 +493,6 @@ export default function Home() {
         <div className="max-w-6xl mx-auto px-6 h-14 flex items-center justify-between">
           <span className="text-[15px] font-semibold text-gray-900 tracking-tight">SuperAccount</span>
           <div className="flex items-center gap-3">
-            {overdueSchvalena > 0 && (
-              <div className="flex items-center gap-1.5">
-                <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full bg-red-500 text-white text-[11px] font-bold">{overdueSchvalena}</span>
-                <span className="text-[12px] text-red-600 font-medium">po splatnosti</span>
-              </div>
-            )}
             {classifying && (
               <span className="text-[12px] text-gray-400 animate-pulse">Klasifikuji kategorie…</span>
             )}
@@ -523,7 +517,7 @@ export default function Home() {
                     : t.key === 'vydane' ? vydane.length || null
                     : t.key === 'vse' || t.key === 'pravidla' ? null
                     : count(t.key)
-                  const showRedBadge = (t.key === 'nova' || t.key === 'nesparovane') && cnt && cnt > 0
+                  const showRedBadge = (t.key === 'nova' || t.key === 'nesparovane' || (t.key === 'schvalena' && overdueSchvalena > 0)) && cnt && cnt > 0
                   return (
                     <button
                       key={t.key}
@@ -536,7 +530,7 @@ export default function Home() {
                       {cnt !== null && (
                         showRedBadge ? (
                           <span className="ml-1.5 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-bold">
-                            {cnt}
+                            {t.key === 'schvalena' ? overdueSchvalena : cnt}
                           </span>
                         ) : (
                           <span className="ml-1.5 text-[11px] text-gray-400">{cnt}</span>
