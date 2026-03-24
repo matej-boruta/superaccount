@@ -484,6 +484,29 @@ export default function Home() {
     e.target.value = ''
   }
 
+  // Všichni dodavatelé: pravidla (deduplikovaná) + dodavatelé z faktur bez pravidla
+  const allSuppliers: (Pravidlo & { _synthetic?: boolean })[] = (() => {
+    const seenPatterns = new Set<string>()
+    const result: (Pravidlo & { _synthetic?: boolean })[] = []
+    for (const p of pravidla) {
+      const key = p.dodavatel_pattern.toUpperCase()
+      if (!seenPatterns.has(key)) { seenPatterns.add(key); result.push(p) }
+    }
+    // Přidej dodavatele z faktur, kteří nemají pravidlo
+    const uniqueDodavatele = [...new Set(faktury.map(f => f.dodavatel).filter(Boolean))]
+    for (const d of uniqueDodavatele) {
+      const hasRule = pravidla.some(p => {
+        const pattern = p.dodavatel_pattern.replace(/%/g, '').toUpperCase()
+        return pattern && d.toUpperCase().includes(pattern)
+      })
+      if (!hasRule) {
+        const ico = faktury.find(f => f.dodavatel === d)?.ico ?? null
+        result.push({ id: -(result.length + 1), dodavatel_pattern: d, ico, typ_platby: null, auto_schvalit: false, auto_parovat: false, poznamka: null, kategorie_id: null, _synthetic: true })
+      }
+    }
+    return result.sort((a, b) => a.dodavatel_pattern.localeCompare(b.dodavatel_pattern, 'cs'))
+  })()
+
   const togglePravidlo = async (id: number, field: 'auto_schvalit' | 'auto_parovat', val: boolean) => {
     setPravidla(prev => prev.map(p => p.id === id ? { ...p, [field]: val } : p))
     await fetch('/api/pravidla', {
@@ -1057,46 +1080,40 @@ export default function Home() {
             <table className="w-full text-sm">
               <thead className="bg-gray-50 border-b border-gray-100">
                 <tr>
-                  <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Dodavatel (pattern)</th>
+                  <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Dodavatel</th>
                   <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Typ platby</th>
-                  <th className="px-5 py-3 text-center text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Auto schválit</th>
                   <th className="px-5 py-3 text-center text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Auto párovat</th>
-                  <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Poznámka</th>
+                  <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide w-1/2">Pravidla zaúčtování</th>
                 </tr>
               </thead>
               <tbody>
-                {pravidla.map((p, i) => (
-                    <tr key={p.id} className={`border-b border-gray-50 hover:bg-gray-50/50 ${i % 2 === 0 ? '' : 'bg-gray-50/20'}`}>
+                {allSuppliers.map((p, i) => (
+                    <tr key={p.id} className={`border-b border-gray-50 hover:bg-gray-50/50 ${p._synthetic ? 'opacity-60' : ''}`}>
                       <td className="px-5 py-3">
-                        <div className="text-[13px] font-mono font-medium text-gray-900">{p.dodavatel_pattern}</div>
+                        <div className={`text-[13px] font-medium text-gray-900 ${p._synthetic ? '' : 'font-mono'}`}>{p.dodavatel_pattern}</div>
                         {p.ico && <div className="text-[11px] text-gray-400 mt-0.5">IČO {p.ico}</div>}
+                        {p._synthetic && <div className="text-[10px] text-orange-500 mt-0.5">bez pravidla</div>}
                       </td>
                       <td className="px-5 py-3">
-                        <span className={`inline-flex px-2 py-0.5 rounded-full text-[11px] font-medium ${
-                          p.typ_platby === 'karta' ? 'bg-blue-50 text-blue-700' :
-                          p.typ_platby === 'prevod' ? 'bg-purple-50 text-purple-700' :
-                          'bg-gray-100 text-gray-500'
-                        }`}>
-                          {p.typ_platby ?? '—'}
-                        </span>
+                        {p.typ_platby ? (
+                          <span className={`inline-flex px-2 py-0.5 rounded-full text-[11px] font-medium ${
+                            p.typ_platby === 'karta' ? 'bg-blue-50 text-blue-700' :
+                            p.typ_platby === 'prevod' ? 'bg-purple-50 text-purple-700' :
+                            'bg-gray-100 text-gray-500'
+                          }`}>{p.typ_platby}</span>
+                        ) : <span className="text-gray-300">—</span>}
                       </td>
                       <td className="px-5 py-3 text-center">
-                        <button
-                          onClick={() => togglePravidlo(p.id, 'auto_schvalit', !p.auto_schvalit)}
-                          className={`w-10 h-5 rounded-full transition-colors relative ${p.auto_schvalit ? 'bg-green-500' : 'bg-gray-200'}`}
-                        >
-                          <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${p.auto_schvalit ? 'translate-x-5' : 'translate-x-0.5'}`} />
-                        </button>
+                        {!p._synthetic ? (
+                          <button
+                            onClick={() => togglePravidlo(p.id, 'auto_parovat', !p.auto_parovat)}
+                            className={`w-10 h-5 rounded-full transition-colors relative ${p.auto_parovat ? 'bg-green-500' : 'bg-gray-200'}`}
+                          >
+                            <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${p.auto_parovat ? 'translate-x-5' : 'translate-x-0.5'}`} />
+                          </button>
+                        ) : <span className="text-gray-300">—</span>}
                       </td>
-                      <td className="px-5 py-3 text-center">
-                        <button
-                          onClick={() => togglePravidlo(p.id, 'auto_parovat', !p.auto_parovat)}
-                          className={`w-10 h-5 rounded-full transition-colors relative ${p.auto_parovat ? 'bg-green-500' : 'bg-gray-200'}`}
-                        >
-                          <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${p.auto_parovat ? 'translate-x-5' : 'translate-x-0.5'}`} />
-                        </button>
-                      </td>
-                      <td className="px-5 py-3 text-[12px] text-gray-500">{p.poznamka ?? '—'}</td>
+                      <td className="px-5 py-3 text-[12px] text-gray-600">{p.poznamka ?? <span className="text-gray-300">—</span>}</td>
                     </tr>
                   ))}
               </tbody>
