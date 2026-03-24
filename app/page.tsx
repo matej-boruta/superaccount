@@ -540,7 +540,11 @@ export default function Home() {
         result.push({ id: -(result.length + 1), dodavatel_pattern: d, ico, typ_platby: null, auto_schvalit: false, auto_parovat: false, poznamka: null, kategorie_id: null, _synthetic: true })
       }
     }
-    return result.sort((a, b) => a.dodavatel_pattern.localeCompare(b.dodavatel_pattern, 'cs'))
+    return result.sort((a, b) => {
+      if (!a._synthetic && b._synthetic) return -1
+      if (a._synthetic && !b._synthetic) return 1
+      return a.dodavatel_pattern.localeCompare(b.dodavatel_pattern, 'cs')
+    })
   })()
 
   const togglePravidlo = async (id: number, field: 'auto_schvalit' | 'auto_parovat', val: boolean) => {
