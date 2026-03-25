@@ -6,7 +6,7 @@ const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI!
 // Scopes: Gmail read + Drive (upload/sync faktur) + Google Ads API + userinfo
 const SCOPES = [
   'https://www.googleapis.com/auth/gmail.readonly',
-  'https://www.googleapis.com/auth/drive.file',
+  'https://www.googleapis.com/auth/drive',
   'https://www.googleapis.com/auth/adwords',
   'https://www.googleapis.com/auth/userinfo.email',
 ].join(' ')
