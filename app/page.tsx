@@ -58,7 +58,7 @@ function fmtDate(d: string | null | undefined) {
   return date.toLocaleDateString('cs-CZ', { day: 'numeric', month: 'short', year: 'numeric' })
 }
 
-type Tab = 'nova' | 'schvalena' | 'zaplacena' | 'zamitnuta' | 'vse' | 'sparovane' | 'nesparovane' | 'vydane' | 'pravidla'
+type Tab = 'nova' | 'schvalena' | 'zaplacena' | 'zamitnuta' | 'vse' | 'sparovane' | 'nesparovane' | 'vydane' | 'pravidla' | 'abra'
 
 type Pravidlo = {
   id: number
@@ -95,9 +95,9 @@ const TABS = [
   { key: 'zamitnuta' as Tab, label: 'Zamítnuté' },
   { key: 'sparovane' as Tab, label: 'Spárované' },
   { key: 'nesparovane' as Tab, label: 'Nespárované' },
-  { key: 'vse' as Tab, label: 'Vše' },
   { key: 'vydane' as Tab, label: 'Vydané faktury' },
   { key: 'pravidla' as Tab, label: 'Pravidla dodavatelů' },
+  { key: 'abra' as Tab, label: 'ABRA check' },
 ]
 
 function dayLabel(d: string): string | null {
@@ -193,8 +193,11 @@ export default function Home() {
   const [transakceLoading, setTransakceLoading] = useState(false)
   const [tFilter, setTFilter] = useState<TFilter>('vse')
   const [dodavatelSearch, setDodavatelSearch] = useState('')
+  const [transakceSearch, setTransakceSearch] = useState('')
   const [activePicker, setActivePicker] = useState<number | null>(null)
   const [skipped, setSkipped] = useState<Set<number>>(new Set())
+  const [rejectedSuggestions, setRejectedSuggestions] = useState<Set<number>>(new Set())
+  const [transakceDir, setTransakceDir] = useState<'vse' | 'prijate' | 'odeslane'>('vse')
   // Map<fakturaId, transakceId> — checked pairs in párování
   const [selectedPairs, setSelectedPairs] = useState<Map<number, number>>(new Map())
 
@@ -279,7 +282,11 @@ export default function Home() {
     }
   }
 
-  useEffect(() => { load() }, [])
+  useEffect(() => {
+    load()
+    // Background ABRA sync — fire and forget, catches any gaps from previous sessions
+    fetch('/api/abra-sync', { method: 'POST' }).catch(() => {})
+  }, [])
 
   useEffect(() => {
     if (tab === 'schvalena' || tab === 'sparovane' || tab === 'nesparovane') loadTransakce(faktury)
@@ -339,6 +346,8 @@ export default function Home() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fakturaId, transakceId }),
     })
+    // Background ABRA sync after pairing — catches any failures in sparovat's inline ABRA call
+    fetch('/api/abra-sync', { method: 'POST' }).catch(() => {})
     await loadTransakce()
     setProcessing(false)
     setActivePicker(null)
@@ -370,7 +379,18 @@ export default function Home() {
     const base = tab === 'vse' ? faktury : isTransakceTab ? [] : faktury.filter(f => f.stav === tab)
     if (tab === 'zaplacena' && dodavatelSearch.trim()) {
       const q = dodavatelSearch.trim().toLowerCase()
-      return base.filter(f => f.dodavatel.toLowerCase().includes(q))
+      return base.filter(f => {
+        const kat = kategorieList.find(k => k.id === (kategorieOverride.get(f.id) ?? f.kategorie_id))
+        const katStr = kat ? `${kat.l1} ${kat.l2}`.toLowerCase() : ''
+        const castkaStr = String(f.castka_s_dph)
+        return (
+          f.dodavatel.toLowerCase().includes(q) ||
+          (f.cislo_faktury || '').toLowerCase().includes(q) ||
+          (f.variabilni_symbol || '').toLowerCase().includes(q) ||
+          katStr.includes(q) ||
+          castkaStr.includes(q)
+        )
+      })
     }
     return base
   })()
@@ -490,6 +510,46 @@ export default function Home() {
   const [csvImporting, setCsvImporting] = useState(false)
   const [csvResult, setCsvResult] = useState<string | null>(null)
 
+  // ABRA reconcile
+  const [abraLoading, setAbraLoading] = useState(false)
+  const [abraFixing, setAbraFixing] = useState<string | null>(null)
+  const [abraFixResult, setAbraFixResult] = useState<string | null>(null)
+  const [abraResult, setAbraResult] = useState<{
+    stats: { sbTotal: number; abraTotal: number; matched: number; diffWithTransakce: number; diffWithoutTransakce: number; sbSparovaneTotal: number; abraBankaTotal: number }
+    onlySB: Array<{ id: number; dodavatel: string; cislo_faktury: string; castka_s_dph: number; mena: string; stav: string }>
+    onlyABRA: Array<{ id: string; kod: string; stavUhrady: string; sumCelkem: number; firma: string }>
+    diff: Array<{ sb: { id: number; dodavatel: string; cislo_faktury: string; castka_s_dph: number; mena: string; stav: string }; abra: { kod: string; stavUhrady: string; id: string }; abraStav: string; transakce: { id: number; datum: string; castka: number; mena: string } | null }>
+    banka?: { sbBezBanky: Array<{ sbId: number; dodavatel: string; castka: number; mena: string; datum: string }>; abraBankaBezSB: Array<{ id: string; popis: string; sumOsv: number; datVyst: string }> }
+  } | null>(null)
+
+  const loadAbraReconcile = async () => {
+    setAbraLoading(true)
+    try {
+      const res = await fetch('/api/abra-reconcile')
+      const data = await res.json()
+      setAbraResult(data)
+    } catch {
+      setAbraResult(null)
+    }
+    setAbraLoading(false)
+  }
+
+  const abraFix = async (action: string, extraBody?: Record<string, unknown>) => {
+    setAbraFixing(action)
+    setAbraFixResult(null)
+    const res = await fetch('/api/abra-fix', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, ...extraBody }),
+    })
+    const data = await res.json()
+    if (data.errors?.length) setAbraFixResult(`Chyby (${data.errors.length}): ${data.errors.slice(0, 3).join(', ')}`)
+    else if (data.created !== undefined) setAbraFixResult(`Zaúčtováno: ${data.created}, přeskočeno: ${data.skipped ?? 0}`)
+    else if (data.fixed !== undefined) setAbraFixResult(`Opraveno: ${data.fixed}`)
+    setAbraFixing(null)
+    await loadAbraReconcile()
+  }
+
   const loadVydane = async () => {
     setVydaneLoading(true)
     const res = await fetch('/api/vydane')
@@ -500,6 +560,7 @@ export default function Home() {
 
   useEffect(() => {
     if (tab === 'vydane') loadVydane()
+    if (tab === 'abra') loadAbraReconcile()
   }, [tab])
 
   const handleCsvImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -556,6 +617,32 @@ export default function Home() {
     })
   }
 
+  const renderPravidloText = (text: string | null) => {
+    if (!text) return <span className="text-gray-300">—</span>
+    const LABELS: Array<{label: string; re: RegExp}> = [
+      { label: 'Klíčové slovo', re: /^keyword:/i },
+      { label: 'Platba',        re: /\bplatba\b/i },
+      { label: 'Párování',      re: /\bpárování\b|\bpárovat\b/i },
+      { label: 'DPH',           re: /\bDPH\b|\breverse\b|\bosvoboz/i },
+      { label: 'Perioda',       re: /\bfakturováno\b|\bměsíčně\b|\bčtvrtletně\b|\bročně\b/i },
+      { label: 'Popis',         re: /./ },
+    ]
+    const sentences = text.split(/\.\s+/).map(s => s.replace(/\.$/, '').trim()).filter(Boolean)
+    return (
+      <div className="space-y-1.5">
+        {sentences.map((s, i) => {
+          const label = (LABELS.find(l => l.re.test(s)) ?? LABELS[LABELS.length - 1]).label
+          return (
+            <div key={i} className="flex gap-2 items-baseline text-[12px] leading-snug">
+              <span className="font-semibold text-gray-800 shrink-0 w-[100px]">{label}</span>
+              <span className="text-gray-500">{s}</span>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
   return (
     <div style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", sans-serif' }}
       className="min-h-screen bg-[#f5f5f7]">
@@ -586,7 +673,7 @@ export default function Home() {
                   const cnt = t.key === 'sparovane' ? transakce.filter(tx => tx.stav === 'sparovano').length
                     : t.key === 'nesparovane' ? transakce.filter(tx => tx.stav === 'nesparovano').length
                     : t.key === 'vydane' ? vydane.length || null
-                    : t.key === 'vse' || t.key === 'pravidla' ? null
+                    : t.key === 'vse' || t.key === 'pravidla' || t.key === 'abra' ? null
                     : count(t.key)
                   const showRedBadge = (t.key === 'nova' || t.key === 'nesparovane' || (t.key === 'schvalena' && overdueSchvalena > 0)) && cnt && cnt > 0
                   return (
@@ -663,13 +750,13 @@ export default function Home() {
               )}
             </div>
 
-        {tab !== 'pravidla' && tab !== 'vydane' && (<>
+        {tab !== 'pravidla' && tab !== 'vydane' && tab !== 'abra' && (<>
             {/* Filtr dodavatele pro zaplacené */}
             {tab === 'zaplacena' && (
               <div className="mb-4 flex items-center gap-2">
                 <input
                   type="text"
-                  placeholder="Hledat dodavatele…"
+                  placeholder="Hledat dodavatele, fakturu, VS, kategorii, částku…"
                   value={dodavatelSearch}
                   onChange={e => setDodavatelSearch(e.target.value)}
                   className="w-64 px-3 py-2 text-[13px] rounded-xl border border-black/[0.1] bg-white outline-none focus:border-[#0071e3] placeholder:text-gray-400"
@@ -694,7 +781,7 @@ export default function Home() {
               </div>
             )}
 
-            {loading ? (
+            {!isTransakceTab && (loading ? (
               <div className="text-center py-20 text-[13px] text-gray-400">Načítám…</div>
             ) : filteredSorted.length === 0 ? (
               <div className="text-center py-20 text-[13px] text-gray-400">Žádné faktury</div>
@@ -885,7 +972,7 @@ export default function Home() {
                           </td>
                         </tr>
                         {/* Sub-řádek: navrhovaná platba (schvalena) — 7 cols aligned */}
-                        {f.stav === 'schvalena' && suggestion && !showPicker && (() => {
+                        {f.stav === 'schvalena' && suggestion && !showPicker && !rejectedSuggestions.has(f.id) && (() => {
                           const vsOk = !!f.variabilni_symbol && suggestion.variabilni_symbol === f.variabilni_symbol
                           const amtOk = Math.abs(Math.abs(suggestion.castka) - Number(f.castka_s_dph)) < 1
                           return (
@@ -905,23 +992,31 @@ export default function Home() {
                                   <span className="ml-1 text-[11px] text-orange-500">≠</span>
                                 )}
                               </td>
-                              {/* Splatnost col: TX datum (srovnej s datem faktury výše) */}
+                              {/* Vystavení col: prázdné */}
+                              <td></td>
+                              {/* Splatnost col: TX datum */}
                               <td className="px-4 py-2 text-[12px] text-gray-500">{fmtDate(suggestion.datum)}</td>
                               {/* Kategorie col: prázdné */}
                               <td></td>
-                              {/* Částka col: TX částka (srovnej s FA částkou výše) */}
+                              {/* Částka col: TX částka */}
                               <td className="px-4 py-2 text-right">
                                 <span className={`text-[13px] font-semibold ${amtOk ? 'text-green-600' : 'text-orange-500'}`}>
                                   {fmt(Math.abs(suggestion.castka), suggestion.mena)}
                                   {amtOk && <span className="ml-1 text-[11px]">✓</span>}
                                 </span>
                               </td>
-                              {/* Actions col: Spárovat */}
+                              {/* Actions col: Spárovat + Odmítnout */}
                               <td className="px-4 py-2 text-right" onClick={e => e.stopPropagation()}>
-                                <button onClick={() => sparovat(f.id, suggestion.id)} disabled={processing}
-                                  className="px-3 py-1.5 text-[12px] font-medium text-white bg-[#0071e3] rounded-[7px] hover:bg-[#0077ed] disabled:opacity-40 whitespace-nowrap">
-                                  Spárovat
-                                </button>
+                                <div className="flex items-center justify-end gap-2">
+                                  <button onClick={() => setRejectedSuggestions(prev => new Set(prev).add(f.id))}
+                                    className="px-3 py-1.5 text-[12px] font-medium text-gray-500 bg-gray-100 rounded-[7px] hover:bg-gray-200 whitespace-nowrap">
+                                    Odmítnout
+                                  </button>
+                                  <button onClick={() => sparovat(f.id, suggestion.id)} disabled={processing}
+                                    className="px-3 py-1.5 text-[12px] font-medium text-white bg-[#0071e3] rounded-[7px] hover:bg-[#0077ed] disabled:opacity-40 whitespace-nowrap">
+                                    Spárovat
+                                  </button>
+                                </div>
                               </td>
                             </tr>
                           )
@@ -981,50 +1076,101 @@ export default function Home() {
                   </tbody>
                 </table>
               </div>
-            )}
+            ))}
 
             {/* ===== TRANSAKCE ZÁLOŽKY (Spárované / Nespárované) ===== */}
             {isTransakceTab && (() => {
-              const tList = transakce.filter(t => tab === 'sparovane' ? t.stav === 'sparovano' : t.stav === 'nesparovano')
+              const baseList = transakce.filter(t => tab === 'sparovane' ? t.stav === 'sparovano' : t.stav === 'nesparovano')
+              const dirList = transakceDir === 'prijate' ? baseList.filter(t => t.castka > 0)
+                : transakceDir === 'odeslane' ? baseList.filter(t => t.castka < 0)
+                : baseList
+              const q = transakceSearch.trim().toLowerCase()
+              const tList = q ? dirList.filter(t => {
+                const pairedF = t.faktura_id ? faktury.find(f => f.id === t.faktura_id) : null
+                return (t.zprava || '').toLowerCase().includes(q)
+                  || (pairedF?.dodavatel || '').toLowerCase().includes(q)
+                  || (t.variabilni_symbol || '').toLowerCase().includes(q)
+              }) : dirList
+              const nesparPrijate = tab === 'nesparovane' ? baseList.filter(t => t.castka > 0) : []
+              const nesparOdeslane = tab === 'nesparovane' ? baseList.filter(t => t.castka < 0) : []
+              const nesparPrijateSum = nesparPrijate.reduce((s, t) => s + Math.abs(t.castka), 0)
+              const nesparOdeslaneSum = nesparOdeslane.reduce((s, t) => s + Math.abs(t.castka), 0)
               return transakceLoading ? (
                 <div className="text-center py-20 text-[13px] text-gray-400">Načítám…</div>
-              ) : tList.length === 0 ? (
-                <div className="text-center py-20 text-[13px] text-gray-400">Žádné transakce</div>
               ) : (
-                <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-hidden">
-                  <table className="w-full">
-                    <thead>
-                      <tr className="border-b border-gray-100">
-                        <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Datum</th>
-                        <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Popis</th>
-                        <th className="text-right px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Částka</th>
-                        <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">VS</th>
-                        {tab === 'sparovane' && <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Faktura</th>}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {tList.map((t, i) => {
-                        const pairedF = t.faktura_id ? faktury.find(f => f.id === t.faktura_id) : null
-                        return (
-                          <tr key={t.id} className={`${i < tList.length - 1 ? 'border-b border-gray-50' : ''} hover:bg-[#f9f9f9] transition-colors`}>
-                            <td className="px-4 py-3 text-[13px] text-gray-600 whitespace-nowrap">{fmtDate(t.datum)}</td>
-                            <td className="px-4 py-3 max-w-[300px]">
-                              <div className="text-[13px] text-gray-800 line-clamp-1">{t.zprava || '—'}</div>
-                              {t.protiucet && <div className="text-[11px] text-gray-400 font-mono">{t.protiucet}</div>}
-                            </td>
-                            <td className={`px-4 py-3 text-right text-[13px] font-semibold tabular-nums ${t.castka < 0 ? 'text-red-600' : 'text-green-700'}`}>
-                              {fmt(t.castka, t.mena)}
-                            </td>
-                            <td className="px-4 py-3 text-[12px] text-gray-500 font-mono">{t.variabilni_symbol || '—'}</td>
-                            {tab === 'sparovane' && (
-                              <td className="px-4 py-3 text-[12px] text-gray-500">{pairedF ? pairedF.dodavatel : '—'}</td>
-                            )}
+                <>
+                  {tab === 'nesparovane' && (
+                    <div className="mb-4 flex gap-3">
+                      <div className="flex-1 bg-white rounded-2xl shadow-sm border border-black/[0.06] px-5 py-4">
+                        <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Přijaté platby</div>
+                        <div className="text-[22px] font-semibold text-green-600 tabular-nums">{nesparPrijate.length}</div>
+                        <div className="text-[13px] text-gray-500 mt-0.5">celkem <span className="font-semibold text-gray-700">{fmt(nesparPrijateSum, 'CZK')}</span></div>
+                      </div>
+                      <div className="flex-1 bg-white rounded-2xl shadow-sm border border-black/[0.06] px-5 py-4">
+                        <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Odeslané platby</div>
+                        <div className="text-[22px] font-semibold text-red-500 tabular-nums">{nesparOdeslane.length}</div>
+                        <div className="text-[13px] text-gray-500 mt-0.5">celkem <span className="font-semibold text-gray-700">{fmt(nesparOdeslaneSum, 'CZK')}</span></div>
+                      </div>
+                    </div>
+                  )}
+                  <div className="mb-3 flex items-center gap-2">
+                    <input
+                      type="text"
+                      placeholder="Hledat dodavatele, popis, VS…"
+                      value={transakceSearch}
+                      onChange={e => setTransakceSearch(e.target.value)}
+                      className="w-64 px-3 py-2 text-[13px] rounded-xl border border-black/[0.1] bg-white outline-none focus:border-[#0071e3] placeholder:text-gray-400"
+                    />
+                    {transakceSearch && (
+                      <button onClick={() => setTransakceSearch('')} className="text-[12px] text-gray-400 hover:text-gray-600">Zrušit</button>
+                    )}
+                    {(['vse','prijate','odeslane'] as const).map(d => (
+                      <button key={d} onClick={() => setTransakceDir(d)}
+                        className={`px-3 py-1.5 rounded-xl text-[12px] font-medium transition-colors ${transakceDir === d ? 'bg-gray-900 text-white' : 'bg-white border border-black/[0.1] text-gray-600 hover:bg-gray-50'}`}>
+                        {d === 'vse' ? 'Vše' : d === 'prijate' ? '↓ Přijaté' : '↑ Odeslané'}
+                      </button>
+                    ))}
+                    <span className="text-[12px] text-gray-400">{tList.length} transakcí</span>
+                  </div>
+                  {tList.length === 0 ? (
+                    <div className="text-center py-20 text-[13px] text-gray-400">Žádné transakce</div>
+                  ) : (
+                    <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-clip">
+                      <table className="w-full">
+                        <thead className="sticky top-[105px] z-10 bg-white">
+                          <tr className="border-b border-gray-100">
+                            <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Datum</th>
+                            <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Popis</th>
+                            <th className="text-right px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Částka</th>
+                            <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">VS</th>
+                            {tab === 'sparovane' && <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Faktura</th>}
                           </tr>
-                        )
-                      })}
-                    </tbody>
-                  </table>
-                </div>
+                        </thead>
+                        <tbody>
+                          {tList.map((t, i) => {
+                            const pairedF = t.faktura_id ? faktury.find(f => f.id === t.faktura_id) : null
+                            return (
+                              <tr key={t.id} className={`${i < tList.length - 1 ? 'border-b border-gray-50' : ''} hover:bg-[#f9f9f9] transition-colors`}>
+                                <td className="px-4 py-3 text-[13px] text-gray-600 whitespace-nowrap">{fmtDate(t.datum)}</td>
+                                <td className="px-4 py-3 max-w-[300px]">
+                                  <div className="text-[13px] text-gray-800 line-clamp-1">{t.zprava || '—'}</div>
+                                  {t.protiucet && <div className="text-[11px] text-gray-400 font-mono">{t.protiucet}</div>}
+                                </td>
+                                <td className={`px-4 py-3 text-right text-[13px] font-semibold tabular-nums ${t.castka < 0 ? 'text-red-600' : 'text-green-700'}`}>
+                                  {fmt(t.castka, t.mena)}
+                                </td>
+                                <td className="px-4 py-3 text-[12px] text-gray-500 font-mono">{t.variabilni_symbol || '—'}</td>
+                                {tab === 'sparovane' && (
+                                  <td className="px-4 py-3 text-[12px] text-gray-500">{pairedF ? pairedF.dodavatel : '—'}</td>
+                                )}
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </>
               )
             })()}
         </>)}
@@ -1153,11 +1299,223 @@ export default function Home() {
                           </button>
                         ) : <span className="text-gray-300">—</span>}
                       </td>
-                      <td className="px-5 py-3 text-[12px] text-gray-600">{p.poznamka ?? <span className="text-gray-300">—</span>}</td>
+                      <td className="px-5 py-3">{renderPravidloText(p.poznamka ?? null)}</td>
                     </tr>
                   ))}
               </tbody>
             </table>
+          </div>
+        )}
+
+        {/* ===== ABRA CHECK ===== */}
+        {tab === 'abra' && (
+          <div className="space-y-5">
+            {abraResult && (
+              <div className="flex items-center gap-3 flex-wrap">
+                <span className="text-[13px] text-gray-400">
+                  Faktury — SB: {abraResult.stats.sbTotal} · ABRA: {abraResult.stats.abraTotal} · Shoda: {abraResult.stats.matched}
+                  {abraResult.stats.abraBankaTotal !== undefined && ` · Banka ABRA (FP-*): ${abraResult.stats.abraBankaTotal}`}
+                  {' · '}
+                  <button onClick={loadAbraReconcile} className="text-[#0071e3] hover:underline">Obnovit</button>
+                </span>
+                {abraFixResult && (
+                  <span className={`text-[12px] px-2 py-0.5 rounded-lg ${abraFixResult.includes('Chyby') ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
+                    {abraFixResult}
+                  </span>
+                )}
+              </div>
+            )}
+            <div className="space-y-5">
+              {abraLoading && <div className="text-center py-10 text-[13px] text-gray-400">Načítám z ABRA…</div>}
+              {!abraLoading && abraResult && (<>
+                {/* Diff: rozdílný stav */}
+                {abraResult.diff.length > 0 && (
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <div>
+                        <div className="text-[12px] font-semibold text-orange-600 uppercase tracking-wider">Rozdílný stav ({abraResult.diff.length})</div>
+                        <div className="text-[11px] text-gray-400 mt-0.5">
+                          {abraResult.stats.diffWithTransakce ?? 0} s párovanou transakcí · {abraResult.stats.diffWithoutTransakce ?? 0} bez
+                        </div>
+                      </div>
+                      <div className="flex gap-2">
+                        {(abraResult.stats.diffWithTransakce ?? 0) > 0 && (
+                          <button onClick={() => abraFix('create-banka-bulk')} disabled={abraFixing !== null}
+                            className="px-3 py-1 text-[12px] font-medium text-white bg-green-600 rounded-lg hover:bg-green-700 disabled:opacity-40">
+                            {abraFixing === 'create-banka-bulk' ? 'Zaúčtovávám…' : `Zaúčtovat banka (${abraResult.stats.diffWithTransakce})`}
+                          </button>
+                        )}
+                        {(abraResult.stats.diffWithoutTransakce ?? 0) > 0 && (
+                          <button onClick={() => abraFix('fix-stav-bulk')} disabled={abraFixing !== null}
+                            className="px-3 py-1 text-[12px] font-medium text-orange-700 bg-orange-100 rounded-lg hover:bg-orange-200 disabled:opacity-40">
+                            {abraFixing === 'fix-stav-bulk' ? 'Opravuji…' : `Ručně označit (${abraResult.stats.diffWithoutTransakce})`}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      {abraResult.diff.map(d => {
+                        const hasTrans = 'transakce' in d && d.transakce != null
+                        return (
+                          <div key={d.sb.id} className="flex items-center justify-between px-3 py-2 rounded-xl bg-orange-50 border border-orange-100">
+                            <div>
+                              <div className="text-[13px] font-medium text-gray-900">{d.sb.dodavatel}</div>
+                              <div className="text-[11px] text-gray-400">{d.sb.cislo_faktury} · {d.abra.kod}</div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <div className="text-right">
+                                <div className="text-[12px] font-semibold text-gray-700">{fmt(d.sb.castka_s_dph, d.sb.mena)}</div>
+                                <div className="text-[11px] mt-0.5">
+                                  <span className={`px-1.5 py-0.5 rounded-full font-medium ${d.sb.stav === 'zaplacena' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>SB: {d.sb.stav}</span>
+                                  {' '}
+                                  <span className="px-1.5 py-0.5 rounded-full font-medium bg-red-100 text-red-700">ABRA: {d.abraStav}</span>
+                                </div>
+                              </div>
+                              {hasTrans ? (
+                                <button
+                                  onClick={() => abraFix('create-banka', { sbId: d.sb.id, abraId: d.abra.id, transakceId: (d as {transakce: {id: number}}).transakce.id })}
+                                  disabled={abraFixing !== null}
+                                  className="px-2 py-1 text-[11px] font-medium text-green-700 bg-green-100 rounded-lg hover:bg-green-200 disabled:opacity-40 whitespace-nowrap"
+                                >Zaúčtovat</button>
+                              ) : (
+                                <button
+                                  onClick={() => abraFix('fix-stav', { abraId: d.abra.id })}
+                                  disabled={abraFixing !== null}
+                                  className="px-2 py-1 text-[11px] font-medium text-orange-700 bg-orange-100 rounded-lg hover:bg-orange-200 disabled:opacity-40 whitespace-nowrap"
+                                >Ručně</button>
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Pouze v SB */}
+                {abraResult.onlySB.length > 0 && (
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-[12px] font-semibold text-red-600 uppercase tracking-wider">Jen v aplikaci, chybí v ABRA ({abraResult.onlySB.length})</div>
+                      <button
+                        onClick={() => abraFix('create-in-abra-bulk')}
+                        disabled={abraFixing !== null}
+                        className="px-3 py-1 text-[12px] font-medium text-white bg-red-500 rounded-lg hover:bg-red-600 disabled:opacity-40"
+                      >
+                        {abraFixing === 'create-in-abra-bulk' ? 'Vytvářím…' : `Vytvořit vše v ABRA (${abraResult.onlySB.length})`}
+                      </button>
+                    </div>
+                    <div className="space-y-1">
+                      {abraResult.onlySB.map(f => (
+                        <div key={f.id} className="flex items-center justify-between px-3 py-2 rounded-xl bg-red-50 border border-red-100">
+                          <div>
+                            <div className="text-[13px] font-medium text-gray-900">{f.dodavatel}</div>
+                            <div className="text-[11px] text-gray-400">{f.cislo_faktury}</div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <div className="text-right">
+                              <div className="text-[12px] font-semibold text-gray-700">{fmt(f.castka_s_dph, f.mena)}</div>
+                              <div className={`text-[11px] px-1.5 py-0.5 rounded-full font-medium mt-0.5 inline-block ${f.stav === 'zaplacena' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>
+                                {f.stav}
+                              </div>
+                            </div>
+                            <button
+                              onClick={() => abraFix('create-in-abra', { sbId: f.id })}
+                              disabled={abraFixing !== null}
+                              className="px-2 py-1 text-[11px] font-medium text-red-700 bg-red-100 rounded-lg hover:bg-red-200 disabled:opacity-40 whitespace-nowrap"
+                            >
+                              Vytvořit
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Pouze v ABRA */}
+                {abraResult.onlyABRA.length > 0 && (
+                  <div>
+                    <div className="text-[12px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Jen v ABRA, chybí v aplikaci ({abraResult.onlyABRA.length})</div>
+                    <div className="space-y-1">
+                      {abraResult.onlyABRA.map(f => (
+                        <div key={f.id} className="flex items-center justify-between px-3 py-2 rounded-xl bg-gray-50 border border-gray-100">
+                          <div>
+                            <div className="text-[13px] font-medium text-gray-700">{f.firma}</div>
+                            <div className="text-[11px] text-gray-400">{f.kod}</div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <div className="text-[12px] font-semibold text-gray-600">{fmt(f.sumCelkem, 'CZK')}</div>
+                            <button
+                              onClick={() => abraFix('delete-abra', { abraId: f.id })}
+                              disabled={abraFixing !== null}
+                              className="px-2 py-1 text-[11px] font-medium text-red-600 bg-red-50 rounded-lg hover:bg-red-100 disabled:opacity-40 whitespace-nowrap"
+                            >
+                              Smazat z ABRA
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Banka porovnání */}
+                {abraResult.banka && (abraResult.banka.sbBezBanky.length > 0 || abraResult.banka.abraBankaBezSB.length > 0) && (
+                  <div>
+                    <div className="text-[12px] font-semibold text-gray-500 uppercase tracking-wider mb-1">
+                      Banka doklady · SB spárované: {abraResult.stats.sbSparovaneTotal} · ABRA banka (FP-*): {abraResult.stats.abraBankaTotal}
+                    </div>
+                    <div className="space-y-3 mt-2">
+                      {abraResult.banka.sbBezBanky.length > 0 && (
+                        <div>
+                          <div className="text-[11px] font-semibold text-orange-600 uppercase tracking-wider mb-1">Spárováno v aplikaci, chybí banka doklad v ABRA ({abraResult.banka.sbBezBanky.length})</div>
+                          <div className="space-y-1">
+                            {abraResult.banka.sbBezBanky.map(b => (
+                              <div key={b.sbId} className="flex items-center justify-between px-3 py-2 rounded-xl bg-orange-50 border border-orange-100">
+                                <div>
+                                  <div className="text-[13px] font-medium text-gray-900">{b.dodavatel}</div>
+                                  <div className="text-[11px] text-gray-400">FP-{b.sbId} · {fmtDate(b.datum)}</div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <span className="text-[12px] font-semibold text-gray-700">{fmt(b.castka, b.mena)}</span>
+                                  <button
+                                    onClick={() => abraFix('create-banka', { sbId: b.sbId, abraId: abraResult!.diff.find(d => d.sb.id === b.sbId)?.abra.id ?? '', transakceId: 0 })}
+                                    disabled={abraFixing !== null}
+                                    className="px-2 py-1 text-[11px] font-medium text-orange-700 bg-orange-100 rounded-lg hover:bg-orange-200 disabled:opacity-40 whitespace-nowrap"
+                                  >Zaúčtovat</button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {abraResult.banka.abraBankaBezSB.length > 0 && (
+                        <div>
+                          <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Banka doklad v ABRA bez SB transakce ({abraResult.banka.abraBankaBezSB.length})</div>
+                          <div className="space-y-1">
+                            {abraResult.banka.abraBankaBezSB.map(b => (
+                              <div key={b.id} className="flex items-center justify-between px-3 py-2 rounded-xl bg-gray-50 border border-gray-100">
+                                <div className="text-[13px] text-gray-700">{b.popis}</div>
+                                <div className="text-[12px] font-semibold text-gray-600">{fmt(b.sumOsv, 'CZK')} · {fmtDate(b.datVyst)}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {abraResult.diff.length === 0 && abraResult.onlySB.length === 0 && abraResult.onlyABRA.length === 0 &&
+                 (!abraResult.banka || (abraResult.banka.sbBezBanky.length === 0 && abraResult.banka.abraBankaBezSB.length === 0)) && (
+                  <div className="text-center py-10 text-[13px] text-gray-400">Vše sedí, žádné rozdíly</div>
+                )}
+              </>)}
+              {!abraLoading && !abraResult && (
+                <div className="text-center py-10 text-[13px] text-red-500">Chyba při načítání z ABRA</div>
+              )}
+            </div>
           </div>
         )}
 

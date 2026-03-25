@@ -60,8 +60,8 @@ export async function POST(req: Request) {
       const datPlatby = t?.datum
         ? t.datum.split('T')[0]
         : (f.datum_platby ? f.datum_platby.split('T')[0] : new Date().toISOString().split('T')[0])
-      const castka = Number(f.castka_s_dph)
-      const mena = f.mena || 'CZK'
+      const fakturaCastka = Number(f.castka_s_dph)  // v měně faktury (EUR/USD/CZK)
+      const bankaCastka = t ? Math.abs(Number(t.castka)) : fakturaCastka  // CZK z FIO
 
       // Create banka record paired with faktura-prijata via uhrada
       const bankaRes = await fetch(`${ABRA_URL}/banka.json`, {
@@ -77,12 +77,12 @@ export async function POST(req: Request) {
               datVyst: datPlatby,
               datUcto: datPlatby,
               popis: `Platba ${abraKod} - ${f.dodavatel}`,
-              mena: `code:${mena}`,
-              sumOsv: castka,
+              mena: 'code:CZK',
+              sumOsv: bankaCastka,
               primUcet: 'code:221001',
               protiUcet: 'code:321001',
               ...(abraFa.firma ? { firma: abraFa.firma } : {}),
-              uhrada: [{ dokladFaktPrij: { id: abraFa.id }, castka }],
+              uhrada: [{ dokladFaktPrij: { id: abraFa.id }, castka: fakturaCastka }],
             }],
           },
         }),
