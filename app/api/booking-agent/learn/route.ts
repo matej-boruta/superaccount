@@ -6,6 +6,7 @@
  * Respektuje české účetní principy (podvojnost, DUZP, DPH).
  */
 import { NextResponse } from 'next/server'
+import { savePravidlo } from '@/lib/rules'
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
@@ -176,6 +177,26 @@ export async function POST() {
     }
 
     await Promise.all([upsertVzor(vzorFaktura), upsertVzor(vzorPlatba)])
+
+    // Také ulož do ucetni_pravidla (nová konsolidovaná tabulka) — přepíše jen pokud confidence > existující
+    await savePravidlo({
+      typ: 'predkontace',
+      dodavatel,
+      ico: ico ?? null,
+      kategorie_id: mostCommonKat,
+      md_ucet: ucty.md,
+      dal_ucet: '321001',
+      sazba_dph: sazba,
+      auto_schvalit: vzorFaktura.auto_schvalit as boolean,
+      auto_parovat: vzorFaktura.auto_parovat as boolean,
+      parovat_keyword: keyword,
+      confidence,
+      zdroj: 'history',
+      poznamka: reverseCharge
+        ? 'Reverse charge §108 odst.3 ZDPH — naučeno z historie'
+        : (typPlatby === 'karta' ? 'DUZP = datum platby kartou (§21/5 ZDPH) — naučeno z historie' : null),
+    })
+
     learned.push(`${dodavatel} (${fList.length}x) → MD:${ucty.md}/DAL:321001 | ${typPlatby ?? 'neznámo'} | conf:${confidence}%`)
   }
 

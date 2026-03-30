@@ -1,4 +1,6 @@
 import { NextResponse } from 'next/server'
+import { callClaude, SYSTEM_AGENT } from '@/lib/claude'
+import { findBestPravidlo, savePravidlo, logDecision } from '@/lib/rules'
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
@@ -38,19 +40,11 @@ async function classifyWithAI(f: { dodavatel?: string; popis?: string; castka_s_
     `ID ${k.id}: ${k.l1} / ${k.l2} – ${k.popis_pro_ai}`
   ).join('\n')
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 10,
-      messages: [{
-        role: 'user',
-        content: `Klasifikuj fakturu do správné kategorie. Odpověz POUZE číslem ID kategorie, nic jiného.
+  const text = await callClaude(
+    ANTHROPIC_API_KEY,
+    [{
+      role: 'user',
+      content: `Klasifikuj fakturu do správné kategorie. Odpověz POUZE číslem ID kategorie, nic jiného.
 
 Faktura:
 - Dodavatel: ${f.dodavatel || ''}
@@ -59,13 +53,11 @@ Faktura:
 
 Dostupné kategorie:
 ${kategorieText}`,
-      }],
-    }),
-  })
+    }],
+    { model: 'claude-haiku-4-5-20251001', maxTokens: 10, system: SYSTEM_AGENT }
+  )
 
-  const data = await res.json()
-  const text = data?.content?.[0]?.text?.trim()
-  const id = parseInt(text)
+  const id = parseInt(text ?? '')
   if (isNaN(id) || id < 1 || id > kategorieList.length) return null
   return id
 }
@@ -119,18 +111,46 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   })
   const kategorieList = await kRes.json()
 
-  // 3. Determine kategorie: body override > already on faktura > AI classification
-  let kategorieId: number | null = bodyKategorieId ?? f.kategorie_id ?? null
+  // 3. Determine kategorie: body override > ucetni_pravidla > already on faktura > AI classification
+  let kategorieId: number | null = bodyKategorieId ?? null
+
+  // Načti pravidlo pro předkontaci
+  const pravidlo = await findBestPravidlo(f.dodavatel ?? '', f.ico ?? null, 'predkontace')
+
+  if (!kategorieId) kategorieId = pravidlo?.kategorie_id ?? f.kategorie_id ?? null
 
   if (!kategorieId && Array.isArray(kategorieList) && kategorieList.length > 0) {
     kategorieId = await classifyWithAI(f, kategorieList)
+  }
+
+  // Pokud uživatel explicitně změnil kategorii → ulož jako pravidlo (učení)
+  const autoKategorieId = pravidlo?.kategorie_id ?? f.kategorie_id ?? null
+  if (bodyKategorieId && bodyKategorieId !== autoKategorieId && f.dodavatel) {
+    await savePravidlo({
+      typ: 'predkontace',
+      dodavatel: f.dodavatel,
+      ico: f.ico ?? null,
+      kategorie_id: bodyKategorieId,
+      confidence: 95,
+      zdroj: 'manual',
+      poznamka: `Manuální korekce při schválení faktury ${id}`,
+    })
+    await logDecision({
+      typ: 'korekce',
+      vstup: { faktura_id: Number(id), dodavatel: f.dodavatel, auto_kategorie: autoKategorieId },
+      vystup: { kategorie_id: bodyKategorieId, zdroj: 'manual_schvaleni' },
+      confidence: 95,
+      pravidlo_zdroj: 'manual',
+      faktura_id: Number(id),
+    })
   }
 
   const kategorie = Array.isArray(kategorieList)
     ? kategorieList.find((k: { id: number }) => k.id === kategorieId)
     : null
 
-  const ucetni_kod = kategorie?.ucetni_kod ?? getAccountFallback(f.dodavatel || '', f.popis || '').ucetni_kod
+  // Předkontace: pravidlo z DB > kategorie.ucetni_kod > fallback
+  const ucetni_kod = pravidlo?.md_ucet ?? kategorie?.ucetni_kod ?? getAccountFallback(f.dodavatel || '', f.popis || '').ucetni_kod
   const stredisko = kategorie?.stredisko ?? getAccountFallback(f.dodavatel || '', f.popis || '').stredisko
 
   // 4. Compute payment date (1 working day before due) — only if splatnost is valid
