@@ -1,12 +1,10 @@
 /**
- * Fio Import — stáhne transakce ze všech 4 účtů a uloží do Supabase
+ * Fio Import — stáhne transakce ze všech účtů a uloží do Supabase
  * Deduplikuje přes fio_id (conflict ignore).
  *
- * Účty:
- *   CZK 1: IK74v4Jb3MABbDjjtm4KqzvlRfoZLadyo770GVzj6GAkn5InY1y3cmfP65Z4BMwD
- *   CZK 2: 4f854NkIPOKplYpNUDswBfvLiIlLvu3jJJdvd6npumxYe1KiILI8qZpXYQRsWSmE
- *   EUR:   xjzpdGYTAHGfpjJFo8zJuRj01ixj2M724ntyOEHW3dolvLUdrlQWckqgqXa9sbqI
- *   USD:   xqeWK1sJBWJKQxqt9xpk5S2H5Ej0pVLZEikonCqSsqAlbL4UHk3XeKSaEX0
+ * Účty (pouze tokeny Boruta, Matěj):
+ *   CZK 1: tp1F55JlAY1MssWulLFAdqNOoywLCpmCXX6kZcnaOhkimfW0Iz0PSXmSSUCmaOQg  (2503421631)
+ *   CZK 2: 4f854NkIPOKplYpNUDswBfvLiIlLvu3jJJdvd6npumxYe1KiILI8qZpXYQRsWSmE  (2500323753)
  *
  * Fio rate limit: 1 request / 30s per token
  */
@@ -17,10 +15,8 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
 
 const FIO_TOKENS = [
-  { token: 'IK74v4Jb3MABbDjjtm4KqzvlRfoZLadyo770GVzj6GAkn5InY1y3cmfP65Z4BMwD', label: 'CZK1' },
+  { token: 'tp1F55JlAY1MssWulLFAdqNOoywLCpmCXX6kZcnaOhkimfW0Iz0PSXmSSUCmaOQg', label: 'CZK1' },
   { token: '4f854NkIPOKplYpNUDswBfvLiIlLvu3jJJdvd6npumxYe1KiILI8qZpXYQRsWSmE', label: 'CZK2' },
-  { token: 'xjzpdGYTAHGfpjJFo8zJuRj01ixj2M724ntyOEHW3dolvLUdrlQWckqgqXa9sbqI', label: 'EUR' },
-  { token: 'xqeWK1sJBWJKQxqt9xpk5S2H5Ej0pVLZEikonCqSsqAlbL4UHk3XeKSaEX0', label: 'USD' },
 ]
 
 const SB_HEADERS = {
