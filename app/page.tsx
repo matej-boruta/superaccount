@@ -1,6 +1,7 @@
 'use client'
 
-import React, { Fragment, useEffect, useState } from 'react'
+import React, { Fragment, useEffect, useState, useCallback } from 'react'
+import { useRouter } from 'next/navigation'
 
 type Faktura = {
   id: number
@@ -336,6 +337,14 @@ function VykazVysledovka() {
 }
 
 export default function Home() {
+  const router = useRouter()
+  const currentYear = new Date().getFullYear()
+  const AVAILABLE_YEARS = [currentYear - 1, currentYear] // 2025, 2026 — rozšiř dle potřeby
+  const [selectedYear, setSelectedYear] = useState<number>(() => {
+    const p = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('rok') : null
+    return p ? parseInt(p) : currentYear
+  })
+
   const [faktury, setFaktury] = useState<Faktura[]>([])
   const [loading, setLoading] = useState(true)
   const [tab, setTab] = useState<Tab>('nova')
@@ -361,9 +370,10 @@ export default function Home() {
   // Map<fakturaId, transakceId> — checked pairs in párování
   const [selectedPairs, setSelectedPairs] = useState<Map<number, number>>(new Map())
 
-  const load = async () => {
+  const load = useCallback(async (year?: number) => {
+    const rok = year ?? selectedYear
     setLoading(true)
-    const res = await fetch('/api/faktury')
+    const res = await fetch(`/api/faktury?rok=${rok}`)
     const json = await res.json()
     const data: Faktura[] = Array.isArray(json) ? json : []
     setFaktury(data)
@@ -379,8 +389,7 @@ export default function Home() {
         for (let i = 0; i < toClassify.length; i += batchSize) {
           const batch = toClassify.slice(i, i + batchSize)
           await Promise.all(batch.map(f => fetch(`/api/klasifikovat/${f.id}`, { method: 'POST' }).catch(() => {})))
-          // Update faktury after each batch so user sees progress
-          const r = await fetch('/api/faktury')
+          const r = await fetch(`/api/faktury?rok=${rok}`)
           const updated = await r.json()
           if (Array.isArray(updated)) setFaktury(updated)
         }
@@ -388,15 +397,16 @@ export default function Home() {
       }
       run().catch(() => setClassifying(false))
     }
-  }
+  }, [selectedYear])
 
   useEffect(() => {
     fetch('/api/kategorie').then(r => r.json()).then(setKategorieList).catch(() => {})
   }, [])
 
-  const loadTransakce = async (currentFaktury?: Faktura[]) => {
+  const loadTransakce = useCallback(async (currentFaktury?: Faktura[], year?: number) => {
+    const rok = year ?? selectedYear
     setTransakceLoading(true)
-    const res = await fetch('/api/transakce')
+    const res = await fetch(`/api/transakce?rok=${rok}`)
     const data: Transakce[] = await res.json()
     setTransakce(data)
     setTransakceLoading(false)
@@ -437,15 +447,24 @@ export default function Home() {
         })
       ))
       // Reload after auto-pairing
-      const res2 = await fetch('/api/transakce')
+      const res2 = await fetch(`/api/transakce?rok=${rok}`)
       setTransakce(await res2.json())
     }
-  }
+  }, [selectedYear])
+
+  // Reload when year changes
+  useEffect(() => {
+    load(selectedYear)
+    loadTransakce(undefined, selectedYear)
+    // Update URL param
+    const params = new URLSearchParams(window.location.search)
+    params.set('rok', String(selectedYear))
+    router.replace(`?${params.toString()}`, { scroll: false })
+  }, [selectedYear])
 
   useEffect(() => {
-    load()
     // Background ABRA sync — fire and forget, catches any gaps from previous sessions
-    fetch('/api/abra-sync', { method: 'POST' }).catch(() => {})
+    if (selectedYear === currentYear) fetch('/api/abra-sync', { method: 'POST' }).catch(() => {})
     // Auto-parovani on mount — pair any matched invoices, then load today's summary
     fetch('/api/auto-parovani', { method: 'POST' })
       .then(() => { load(); loadTransakce() })
@@ -461,7 +480,7 @@ export default function Home() {
   }, [])
 
   useEffect(() => {
-    if (tab === 'schvalena' || tab === 'sparovane' || tab === 'nesparovane') loadTransakce(faktury)
+    if (tab === 'schvalena' || tab === 'sparovane' || tab === 'nesparovane') loadTransakce(faktury, selectedYear)
   }, [tab])
 
   const [selectedSchvalena, setSelectedSchvalena] = useState<Set<number>>(new Set())
@@ -871,7 +890,20 @@ export default function Home() {
 
       <header className="bg-white/80 backdrop-blur-xl border-b border-black/[0.08] sticky top-0 z-10">
         <div className="max-w-6xl mx-auto px-6 h-14 flex items-center justify-between">
-          <span className="text-[15px] font-semibold text-gray-900 tracking-tight">SuperAccount</span>
+          <div className="flex items-center gap-3">
+            <span className="text-[15px] font-semibold text-gray-900 tracking-tight">SuperAccount</span>
+            <div className="flex items-center rounded-lg border border-gray-200 overflow-hidden text-[12px] font-medium">
+              {AVAILABLE_YEARS.map(y => (
+                <button
+                  key={y}
+                  onClick={() => setSelectedYear(y)}
+                  className={`px-3 py-1 transition-colors ${selectedYear === y ? 'bg-[#0071e3] text-white' : 'text-gray-500 hover:bg-gray-50'}`}
+                >
+                  {y}
+                </button>
+              ))}
+            </div>
+          </div>
           <div className="flex items-center gap-3">
             {classifying && (
               <span className="text-[12px] text-gray-400 animate-pulse">Klasifikuji kategorie…</span>
