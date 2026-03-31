@@ -168,6 +168,30 @@ export async function POST() {
         continue
       }
 
+      // Auto-assign kategorie: 1) from ucetni_pravidla, 2) from previous faktura of same supplier
+      let kategorieId: number | null = null
+      const pravidlaRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/ucetni_pravidla?aktivni=eq.true&kategorie_id=not.is.null&dodavatel_pattern=not.is.null&select=dodavatel_pattern,kategorie_id`,
+        { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+      )
+      const pravidla: { dodavatel_pattern: string; kategorie_id: number }[] = await pravidlaRes.json()
+      const dodavatelUpper = dodavatelParsed.toUpperCase()
+      const matchedPravidlo = pravidla.find(p => {
+        const pat = p.dodavatel_pattern.replace(/%/g, '').toUpperCase()
+        return dodavatelUpper.includes(pat)
+      })
+      if (matchedPravidlo) {
+        kategorieId = matchedPravidlo.kategorie_id
+      } else {
+        // Fallback: inherit from last faktura of same dodavatel
+        const prevRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/faktury?dodavatel=eq.${encodeURIComponent(dodavatelParsed)}&kategorie_id=not.is.null&select=kategorie_id&order=id.desc&limit=1`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+        )
+        const prev = await prevRes.json()
+        if (Array.isArray(prev) && prev.length > 0) kategorieId = prev[0].kategorie_id
+      }
+
       const faktura = {
         cislo_faktury: cisloFaktury,
         dodavatel: dodavatelParsed,
@@ -182,6 +206,7 @@ export async function POST() {
         variabilni_symbol: String(parsed.variabilni_symbol ?? ''),
         stav: 'nova',
         gdrive_file_id: file.id,
+        ...(kategorieId ? { kategorie_id: kategorieId } : {}),
       }
 
       await fetch(`${SUPABASE_URL}/rest/v1/faktury`, {
