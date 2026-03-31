@@ -17,6 +17,15 @@ const SB_HEADERS = {
 export async function POST(req: Request) {
   const { fakturaId, transakceId } = await req.json()
 
+  // Guard: never pair incoming payments (castka > 0) with outgoing invoices
+  const tCheckRes = await fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}&select=castka`, {
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+  })
+  const [tCheck] = await tCheckRes.json()
+  if (tCheck && Number(tCheck.castka) > 0) {
+    return NextResponse.json({ ok: false, error: 'Nelze párovat příchozí platbu s přijatou fakturou' }, { status: 400 })
+  }
+
   // 1. Mark transakce as paired in Supabase
   await fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}`, {
     method: 'PATCH',

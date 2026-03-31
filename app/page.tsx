@@ -1,6 +1,6 @@
 'use client'
 
-import { Fragment, useEffect, useState } from 'react'
+import React, { Fragment, useEffect, useState } from 'react'
 
 type Faktura = {
   id: number
@@ -45,7 +45,8 @@ type Transakce = {
 }
 
 function fmt(n: number, mena: string) {
-  return new Intl.NumberFormat('cs-CZ', { style: 'currency', currency: mena || 'CZK', maximumFractionDigits: 0 }).format(n)
+  const validCurrency = /^[A-Z]{3}$/.test((mena || '').trim()) ? mena.trim() : 'CZK'
+  return new Intl.NumberFormat('cs-CZ', { style: 'currency', currency: validCurrency, maximumFractionDigits: 0 }).format(n)
 }
 
 function fmtDate(d: string | null | undefined) {
@@ -58,7 +59,7 @@ function fmtDate(d: string | null | undefined) {
   return date.toLocaleDateString('cs-CZ', { day: 'numeric', month: 'short', year: 'numeric' })
 }
 
-type Tab = 'nova' | 'schvalena' | 'zaplacena' | 'zamitnuta' | 'vse' | 'sparovane' | 'nesparovane' | 'vydane' | 'pravidla' | 'abra'
+type Tab = 'nova' | 'schvalena' | 'zaplacena' | 'zamitnuta' | 'vse' | 'sparovane' | 'nesparovane' | 'vydane' | 'vykazy' | 'abra'
 
 type Pravidlo = {
   id: number
@@ -96,7 +97,7 @@ const TABS = [
   { key: 'sparovane' as Tab, label: 'Spárované' },
   { key: 'nesparovane' as Tab, label: 'Nespárované' },
   { key: 'vydane' as Tab, label: 'Vydané faktury' },
-  { key: 'pravidla' as Tab, label: 'Pravidla dodavatelů' },
+  { key: 'vykazy' as Tab, label: 'Výkazy' },
   { key: 'abra' as Tab, label: 'ABRA check' },
 ]
 
@@ -158,14 +159,17 @@ function scoreCandidate(faktura: Faktura, t: Transakce): MatchCandidate {
   else if (amtDiff < 0.05) { score += 25; reasons.push('částka ≈') }
   else if (amtDiff < 0.15) { score += 10; reasons.push('částka ~') }
   if (nameInZprava) { score += 15; reasons.push('název ✓') }
-  if (daysDiff <= 7) { score += 10; reasons.push('datum ✓') }
-  else if (daysDiff <= 30) { score += 5; reasons.push('datum ~') }
+  if (daysDiff <= 1) { score += 30; reasons.push('datum D+1 ✓') }
+  else if (daysDiff <= 2) { score += 22; reasons.push('datum D+2 ✓') }
+  else if (daysDiff <= 3) { score += 15; reasons.push('datum D+3') }
+  else if (daysDiff <= 7) { score += 5; reasons.push('datum ~7d') }
+  else if (daysDiff <= 30) { score += 2; reasons.push('datum ~') }
 
   return { t, score, reasons }
 }
 
 function findTopMatches(faktura: Faktura, transakce: Transakce[], n = 3): MatchCandidate[] {
-  const nespar = transakce.filter(t => t.stav === 'nesparovano')
+  const nespar = transakce.filter(t => t.stav === 'nesparovano' && t.castka < 0)
   return nespar
     .map(t => scoreCandidate(faktura, t))
     .filter(c => c.score >= 40)
@@ -178,6 +182,159 @@ function findMatch(faktura: Faktura, transakce: Transakce[]): Transakce | null {
   return top[0]?.t ?? null
 }
 
+type VysledovkaRow = { ucetni_kod: string; l1: string; l2: string; stredisko: string; mesice: Record<number, number> }
+type VysledovkaData = {
+  year: number
+  months: number[]
+  naklady: VysledovkaRow[]
+  nakladyTotal: Record<number, number>
+  vynosy: Record<number, number>  // month → amount
+  poznamka?: string
+}
+
+const MESICE = ['', 'Led', 'Úno', 'Bře', 'Dub', 'Kvě', 'Čvn', 'Čvc', 'Srp', 'Zář', 'Říj', 'Lis', 'Pro']
+
+function VykazVysledovka() {
+  const [open, setOpen] = React.useState(false)
+  const [loading, setLoading] = React.useState(false)
+  const [data, setData] = React.useState<VysledovkaData | null>(null)
+  const [error, setError] = React.useState<string | null>(null)
+
+  const load = async () => {
+    if (data) return  // already loaded
+    setLoading(true)
+    setError(null)
+    try {
+      const res = await fetch('/api/vykazy/vysledovka')
+      const d = await res.json()
+      if (d.error) setError(d.error)
+      else setData(d)
+    } catch (e) {
+      setError(String(e))
+    }
+    setLoading(false)
+  }
+
+  const fmt = (v: number) =>
+    v === 0 ? '—' : new Intl.NumberFormat('cs-CZ', { maximumFractionDigits: 0 }).format(Math.round(v))
+
+  const rowTotal = (mesice: Record<number, number>, months: number[]) =>
+    months.reduce((s, m) => s + (mesice[m] ?? 0), 0)
+
+  return (
+    <div className="space-y-4">
+      <details
+        className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-clip"
+        onToggle={(e) => { if ((e.target as HTMLDetailsElement).open) { setOpen(true); load() } else setOpen(false) }}
+      >
+        <summary className="px-5 py-4 cursor-pointer text-[14px] font-semibold text-gray-800 select-none hover:bg-gray-50 flex items-center justify-between">
+          <span>Analytická výsledovka</span>
+          {data && <span className="text-[12px] font-normal text-gray-400">{data.year} · {data.months.length} měsíců</span>}
+        </summary>
+
+        <div className="px-0 pb-4">
+          {loading && <div className="text-center py-8 text-[13px] text-gray-400">Načítám z ABRA…</div>}
+          {error && <div className="text-center py-8 text-[13px] text-red-500">{error}</div>}
+          {data && !loading && (() => {
+            const months = data.months
+            const colW = 'w-[90px] min-w-[90px]'
+            return (
+              <div className="overflow-x-auto">
+                <table className="w-full text-[12px]">
+                  <thead>
+                    <tr className="border-b border-gray-100 bg-gray-50">
+                      <th className="px-5 py-2 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide sticky left-0 bg-gray-50">Účet</th>
+                      {months.map(m => (
+                        <th key={m} className={`px-3 py-2 text-right text-[11px] font-semibold text-gray-400 uppercase tracking-wide ${colW}`}>
+                          {MESICE[m]}
+                        </th>
+                      ))}
+                      <th className={`px-3 py-2 text-right text-[11px] font-semibold text-gray-500 uppercase tracking-wide ${colW}`}>Celkem</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {/* NÁKLADY */}
+                    <tr className="bg-red-50/60">
+                      <td colSpan={months.length + 2} className="px-5 py-1.5 text-[11px] font-semibold text-red-700 uppercase tracking-wider">Náklady</td>
+                    </tr>
+                    {data.naklady.map(r => (
+                      <tr key={r.ucetni_kod} className="border-b border-gray-50 hover:bg-gray-50/50">
+                        <td className="px-5 py-2 sticky left-0 bg-white">
+                          <span className="font-mono text-[11px] text-gray-400 mr-2">{r.ucetni_kod}</span>
+                          <span className="text-gray-700">{r.l1}{r.l2 ? ` / ${r.l2}` : ''}</span>
+                        </td>
+                        {months.map(m => (
+                          <td key={m} className={`px-3 py-2 text-right text-gray-700 tabular-nums ${colW} ${r.mesice[m] ? '' : 'text-gray-300'}`}>
+                            {fmt(r.mesice[m] ?? 0)}
+                          </td>
+                        ))}
+                        <td className={`px-3 py-2 text-right font-semibold text-gray-800 tabular-nums ${colW}`}>
+                          {fmt(rowTotal(r.mesice, months))}
+                        </td>
+                      </tr>
+                    ))}
+                    <tr className="bg-red-50 border-t-2 border-red-200">
+                      <td className="px-5 py-2 font-semibold text-red-700 sticky left-0 bg-red-50">Náklady celkem</td>
+                      {months.map(m => (
+                        <td key={m} className={`px-3 py-2 text-right font-semibold text-red-700 tabular-nums ${colW}`}>
+                          {fmt(data.nakladyTotal[m] ?? 0)}
+                        </td>
+                      ))}
+                      <td className={`px-3 py-2 text-right font-bold text-red-800 tabular-nums ${colW}`}>
+                        {fmt(rowTotal(data.nakladyTotal, months))}
+                      </td>
+                    </tr>
+
+                    {/* VÝNOSY */}
+                    {Object.keys(data.vynosy).length > 0 && (<>
+                      <tr className="bg-green-50/60">
+                        <td colSpan={months.length + 2} className="px-5 py-1.5 text-[11px] font-semibold text-green-700 uppercase tracking-wider">Výnosy</td>
+                      </tr>
+                      <tr className="bg-green-50 border-t-2 border-green-200">
+                        <td className="px-5 py-2 font-semibold text-green-700 sticky left-0 bg-green-50">Výnosy celkem</td>
+                        {months.map(m => (
+                          <td key={m} className={`px-3 py-2 text-right font-semibold text-green-700 tabular-nums ${colW}`}>
+                            {fmt(data.vynosy[m] ?? 0)}
+                          </td>
+                        ))}
+                        <td className={`px-3 py-2 text-right font-bold text-green-800 tabular-nums ${colW}`}>
+                          {fmt(months.reduce((s, m) => s + (data.vynosy[m] ?? 0), 0))}
+                        </td>
+                      </tr>
+                    </>)}
+
+                    {/* VÝSLEDEK */}
+                    <tr className="border-t-2 border-gray-300 bg-gray-100">
+                      <td className="px-5 py-3 font-bold text-gray-900 sticky left-0 bg-gray-100">Náklady celkem (HV)</td>
+                      {months.map(m => {
+                        const val = (data.vynosy[m] ?? 0) - (data.nakladyTotal[m] ?? 0)
+                        return (
+                          <td key={m} className={`px-3 py-3 text-right font-bold tabular-nums ${colW} ${val >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                            {fmt(val)}
+                          </td>
+                        )
+                      })}
+                      {(() => {
+                        const totalVynosy = months.reduce((s, m) => s + (data.vynosy[m] ?? 0), 0)
+                        const total = totalVynosy - rowTotal(data.nakladyTotal, months)
+                        return (
+                          <td className={`px-3 py-3 text-right font-bold tabular-nums ${colW} ${total >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                            {fmt(total)}
+                          </td>
+                        )
+                      })()}
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            )
+          })()}
+        </div>
+      </details>
+    </div>
+  )
+}
+
 export default function Home() {
   const [faktury, setFaktury] = useState<Faktura[]>([])
   const [loading, setLoading] = useState(true)
@@ -188,6 +345,9 @@ export default function Home() {
   // Map<fakturaId, selectedKategorieId> — for overriding category before approval
   const [kategorieOverride, setKategorieOverride] = useState<Map<number, number>>(new Map())
   const [classifying, setClassifying] = useState(false)
+  type PairedSummaryItem = { dodavatel: string; count: number; castka: number }
+  const [pairedBanner, setPairedBanner] = useState<PairedSummaryItem[] | null>(null)
+  const [pairedBannerExpanded, setPairedBannerExpanded] = useState(false)
 
   const [transakce, setTransakce] = useState<Transakce[]>([])
   const [transakceLoading, setTransakceLoading] = useState(false)
@@ -286,6 +446,18 @@ export default function Home() {
     load()
     // Background ABRA sync — fire and forget, catches any gaps from previous sessions
     fetch('/api/abra-sync', { method: 'POST' }).catch(() => {})
+    // Auto-parovani on mount — pair any matched invoices, then load today's summary
+    fetch('/api/auto-parovani', { method: 'POST' })
+      .then(() => { load(); loadTransakce() })
+      .catch(() => {})
+
+    // Banner: always load today's auto-paired faktury from Supabase (persists across sessions)
+    fetch('/api/dnes-sparovano')
+      .then(r => r.json())
+      .then((summary: { dodavatel: string; count: number; castka: number }[]) => {
+        if (summary.length > 0) setPairedBanner(summary)
+      })
+      .catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -375,20 +547,25 @@ export default function Home() {
 
   // ===== FAKTURY computed =====
   const isTransakceTab = tab === 'sparovane' || tab === 'nesparovane'
+  const [chybejici, setChybejici] = useState<{
+    dodavatel: string; months_present: number[]; avg_castka: number; last_castka: number; mena: string
+    nesparovana_castka: number; nesparovana_mena: string
+  }[] | null>(null)
   const filtered = (() => {
     const base = tab === 'vse' ? faktury : isTransakceTab ? [] : faktury.filter(f => f.stav === tab)
-    if (tab === 'zaplacena' && dodavatelSearch.trim()) {
+    if (dodavatelSearch.trim()) {
       const q = dodavatelSearch.trim().toLowerCase()
       return base.filter(f => {
         const kat = kategorieList.find(k => k.id === (kategorieOverride.get(f.id) ?? f.kategorie_id))
         const katStr = kat ? `${kat.l1} ${kat.l2}`.toLowerCase() : ''
         const castkaStr = String(f.castka_s_dph)
         return (
-          f.dodavatel.toLowerCase().includes(q) ||
+          (f.dodavatel || '').toLowerCase().includes(q) ||
           (f.cislo_faktury || '').toLowerCase().includes(q) ||
           (f.variabilni_symbol || '').toLowerCase().includes(q) ||
           katStr.includes(q) ||
-          castkaStr.includes(q)
+          castkaStr.includes(q) ||
+          (f.popis || '').toLowerCase().includes(q)
         )
       })
     }
@@ -458,7 +635,23 @@ export default function Home() {
   const pairedFakturaIds = new Set(transakce.filter(t => t.faktura_id !== null).map(t => t.faktura_id!))
   const schvalenaUnpaired = faktury.filter(f => f.stav === 'schvalena' && !skipped.has(f.id))
   const nesparTransakce = transakce.filter(t => t.stav === 'nesparovano')
-  const withSuggestions = schvalenaUnpaired.filter(f => findMatch(f, transakce))
+
+  // Sekvenční matching — každá transakce použita max jednou, faktury seřazeny dle data
+  const sequentialSuggestions = (() => {
+    const usedTransIds = new Set<number>()
+    const sorted = [...schvalenaUnpaired].sort((a, b) =>
+      new Date(a.datum_vystaveni).getTime() - new Date(b.datum_vystaveni).getTime()
+    )
+    const result = new Map<number, Transakce>()
+    for (const f of sorted) {
+      const available = transakce.filter(t => t.stav === 'nesparovano' && t.castka < 0 && !usedTransIds.has(t.id))
+      const match = findMatch(f, available)
+      if (match) { result.set(f.id, match); usedTransIds.add(match.id) }
+    }
+    return result
+  })()
+
+  const withSuggestions = schvalenaUnpaired.filter(f => sequentialSuggestions.has(f.id))
   const allPairsChecked = withSuggestions.length > 0 && withSuggestions.every(f => selectedPairs.has(f.id))
   const somePairsChecked = withSuggestions.some(f => selectedPairs.has(f.id))
   const toggleAllPairs = () => {
@@ -466,7 +659,7 @@ export default function Home() {
     const next = new Map<number, number>()
     const usedT = new Set<number>()
     withSuggestions.forEach(f => {
-      const s = findMatch(f, transakce)
+      const s = sequentialSuggestions.get(f.id)
       if (s && !usedT.has(s.id)) { next.set(f.id, s.id); usedT.add(s.id) }
     })
     setSelectedPairs(next)
@@ -522,6 +715,32 @@ export default function Home() {
     banka?: { sbBezBanky: Array<{ sbId: number; dodavatel: string; castka: number; mena: string; datum: string }>; abraBankaBezSB: Array<{ id: string; popis: string; sumOsv: number; datVyst: string }> }
   } | null>(null)
 
+  const [auditFullLoading, setAuditFullLoading] = useState(false)
+  const [auditFullResult, setAuditFullResult] = useState<{
+    data: {
+      sb: { nova: number; schvalena: number; zaplacena: number; zamitnuta: number; faktury_v_abra: number; sparovane_transakce: number }
+      abra: { faktury_fp: number; banka_celkem: number }
+      shoda: { faktury_ok: boolean; faktury_diff: number; banka_ok: boolean; banka_diff: number }
+      rozdily: {
+        chybejici_v_abra: Array<{ id: number; dodavatel: string; stav: string; castka: number; ocekavany_kod: string }>
+        osirelé_v_abra: string[]
+      }
+    }
+    audit: { ok: boolean; rozdily: Array<{ typ: string; popis: string; oprava: string }>; souhrn: string } | null
+  } | null>(null)
+
+  const loadAuditFull = async () => {
+    setAuditFullLoading(true)
+    try {
+      const res = await fetch('/api/agent/audit-full')
+      const data = await res.json()
+      setAuditFullResult(data)
+    } catch {
+      setAuditFullResult(null)
+    }
+    setAuditFullLoading(false)
+  }
+
   const loadAbraReconcile = async () => {
     setAbraLoading(true)
     try {
@@ -561,6 +780,9 @@ export default function Home() {
   useEffect(() => {
     if (tab === 'vydane') loadVydane()
     if (tab === 'abra') loadAbraReconcile()
+    if (tab === 'nova' && chybejici === null) {
+      fetch('/api/chybejici-faktury').then(r => r.json()).then(d => Array.isArray(d) && setChybejici(d)).catch(() => {})
+    }
   }, [tab])
 
   const handleCsvImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -655,6 +877,13 @@ export default function Home() {
               <span className="text-[12px] text-gray-400 animate-pulse">Klasifikuji kategorie…</span>
             )}
             <button
+              onClick={loadAuditFull}
+              disabled={auditFullLoading}
+              className="text-[12px] px-3 py-1 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50 disabled:opacity-50 font-medium"
+            >
+              {auditFullLoading ? 'Audituji…' : 'Audit účetnictví'}
+            </button>
+            <button
               onClick={() => { load(); loadTransakce() }}
               className="text-[13px] text-[#0071e3] hover:text-[#0077ed] font-medium"
             >
@@ -664,7 +893,44 @@ export default function Home() {
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto px-6 py-8">
+<main className="max-w-6xl mx-auto px-6 py-8">
+
+        {/* ── Audit výsledek ── */}
+        {auditFullResult && (
+          <div className={`mb-4 rounded-xl px-4 py-3 text-[13px] ${auditFullResult.audit?.ok === false ? 'bg-red-50 border border-red-200' : 'bg-green-50 border border-green-200'}`}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex-1">
+                <span className={`font-semibold mr-2 ${auditFullResult.audit?.ok === false ? 'text-red-700' : 'text-green-700'}`}>
+                  Audit účetnictví {auditFullResult.audit?.ok === false ? '— nalezeny rozdíly' : '— vše v pořádku'}
+                </span>
+                <span className="text-gray-500">
+                  Faktury: aplikace {auditFullResult.data.sb.faktury_v_abra} (zaplacené + čekající) · ABRA {auditFullResult.data.abra.faktury_fp} FP
+                  {auditFullResult.data.shoda.faktury_diff !== 0 && (
+                    <span className="text-red-600 font-medium"> ({auditFullResult.data.shoda.faktury_diff > 0 ? '+' : ''}{auditFullResult.data.shoda.faktury_diff})</span>
+                  )}
+                  {' · '}
+                  Platby: aplikace {auditFullResult.data.sb.sparovane_transakce} spárovaných · ABRA {auditFullResult.data.abra.banka_celkem} banka
+                  {auditFullResult.data.shoda.banka_diff !== 0 && (
+                    <span className={`font-medium ${Math.abs(auditFullResult.data.shoda.banka_diff) > 50 ? 'text-orange-600' : 'text-gray-400'}`}> ({auditFullResult.data.shoda.banka_diff > 0 ? '+' : ''}{auditFullResult.data.shoda.banka_diff})</span>
+                  )}
+                </span>
+                {auditFullResult.audit?.souhrn && (
+                  <div className="mt-1 text-gray-700">{auditFullResult.audit.souhrn}</div>
+                )}
+                {auditFullResult.audit?.rozdily && auditFullResult.audit.rozdily.length > 0 && (
+                  <div className="mt-2 space-y-1">
+                    {auditFullResult.audit.rozdily.map((r, i) => (
+                      <div key={i} className={`text-[12px] ${r.typ === 'KRITICKÁ' ? 'text-red-700' : 'text-orange-700'}`}>
+                        <span className="font-semibold">[{r.typ}]</span> {r.popis} → {r.oprava}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <button onClick={() => setAuditFullResult(null)} className="text-gray-400 hover:text-gray-600 text-[16px] leading-none">×</button>
+            </div>
+          </div>
+        )}
 
         {/* ── Sticky tabs ── */}
         <div className="sticky top-[52px] z-10 bg-white/90 backdrop-blur-xl border-b border-black/[0.06] -mx-6 px-6 py-2 mb-5 flex items-center justify-between">
@@ -673,7 +939,7 @@ export default function Home() {
                   const cnt = t.key === 'sparovane' ? transakce.filter(tx => tx.stav === 'sparovano').length
                     : t.key === 'nesparovane' ? transakce.filter(tx => tx.stav === 'nesparovano').length
                     : t.key === 'vydane' ? vydane.length || null
-                    : t.key === 'vse' || t.key === 'pravidla' || t.key === 'abra' ? null
+                    : t.key === 'vse' || t.key === 'vykazy' || t.key === 'abra' ? null
                     : count(t.key)
                   const showRedBadge = (t.key === 'nova' || t.key === 'nesparovane' || (t.key === 'schvalena' && overdueSchvalena > 0)) && cnt && cnt > 0
                   return (
@@ -750,16 +1016,16 @@ export default function Home() {
               )}
             </div>
 
-        {tab !== 'pravidla' && tab !== 'vydane' && tab !== 'abra' && (<>
-            {/* Filtr dodavatele pro zaplacené */}
-            {tab === 'zaplacena' && (
+        {tab !== 'vykazy' && tab !== 'vydane' && tab !== 'abra' && (<>
+            {/* Vyhledávání — všechny taby s fakturami */}
+            {!isTransakceTab && (
               <div className="mb-4 flex items-center gap-2">
                 <input
                   type="text"
-                  placeholder="Hledat dodavatele, fakturu, VS, kategorii, částku…"
+                  placeholder="Hledat dodavatele, fakturu, VS, kategorii, částku, popis…"
                   value={dodavatelSearch}
                   onChange={e => setDodavatelSearch(e.target.value)}
-                  className="w-64 px-3 py-2 text-[13px] rounded-xl border border-black/[0.1] bg-white outline-none focus:border-[#0071e3] placeholder:text-gray-400"
+                  className="w-80 px-3 py-2 text-[13px] rounded-xl border border-black/[0.1] bg-white outline-none focus:border-[#0071e3] placeholder:text-gray-400"
                 />
                 {dodavatelSearch && (
                   <button onClick={() => setDodavatelSearch('')} className="text-[12px] text-gray-400 hover:text-gray-600">Zrušit</button>
@@ -770,7 +1036,7 @@ export default function Home() {
 
             {/* Čekající platby summary banner */}
             {tab === 'schvalena' && schvalenaFaktury.length > 0 && (
-              <div className="bg-blue-50 border border-blue-100 rounded-2xl px-5 py-3.5 mb-4 flex items-center gap-3">
+              <div className="bg-blue-50 border border-blue-100 rounded-2xl px-5 py-3.5 mb-4 flex items-center justify-between gap-3">
                 <span className="text-[13px] text-blue-800">
                   <span className="font-semibold">{schvalenaFaktury.length}</span> faktur čeká na zaplacení
                   {' · '}celkem <span className="font-semibold">{fmt(schvalenaCelkem, 'CZK')}</span>
@@ -778,8 +1044,71 @@ export default function Home() {
                     <> · nejbližší platba: <span className="font-semibold">{fmtDate(nejblizsiPlatba.datum_platby)}</span></>
                   )}
                 </span>
+                {(() => {
+                  // Checked invoices that have a suggestion
+                  const checkedWithSuggestion = withSuggestions.filter(f => selectedSchvalena.has(f.id))
+                  if (checkedWithSuggestion.length === 0) return null
+                  return (
+                    <button
+                      disabled={processing}
+                      onClick={async () => {
+                        setProcessing(true)
+                        const usedT = new Set<number>()
+                        for (const f of checkedWithSuggestion) {
+                          const t = sequentialSuggestions.get(f.id)
+                          if (t && !usedT.has(t.id)) {
+                            usedT.add(t.id)
+                            await fetch('/api/sparovat', {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ fakturaId: f.id, transakceId: t.id }),
+                            })
+                          }
+                        }
+                        fetch('/api/abra-sync', { method: 'POST' }).catch(() => {})
+                        await loadTransakce()
+                        setProcessing(false)
+                      }}
+                      className="px-4 py-1.5 text-[12px] font-medium text-white bg-[#0071e3] rounded-[8px] hover:bg-[#0077ed] disabled:opacity-40 whitespace-nowrap"
+                    >
+                      Spárovat navržené ({checkedWithSuggestion.length})
+                    </button>
+                  )
+                })()}
               </div>
             )}
+
+            {/* Auto-párování banner */}
+            {tab === 'schvalena' && pairedBanner && pairedBanner.length > 0 && (() => {
+              const totalCount = pairedBanner.reduce((s, i) => s + i.count, 0)
+              const totalCastka = pairedBanner.reduce((s, i) => s + i.castka, 0)
+              const fmt = (v: number) => new Intl.NumberFormat('cs-CZ', { style: 'currency', currency: 'CZK', maximumFractionDigits: 0 }).format(v)
+              return (
+                <div className="bg-[#e8f4fd] border border-[#b3d9f5] rounded-2xl px-5 py-3 mb-4">
+                  <div className="flex items-center justify-between">
+                    <button onClick={() => setPairedBannerExpanded(e => !e)} className="flex items-center gap-2 text-left">
+                      <span className="text-[12px] font-semibold text-[#0055a5]">Automaticky spárováno dnes</span>
+                      <span className="text-[12px] text-[#3a7abf]">—</span>
+                      <span className="text-[12px] text-[#3a7abf]">{totalCount} {totalCount === 1 ? 'faktura' : totalCount < 5 ? 'faktury' : 'faktur'}</span>
+                      <span className="text-[12px] font-semibold text-[#0055a5]">{fmt(totalCastka)}</span>
+                      <span className="text-[11px] text-[#3a7abf]">{pairedBannerExpanded ? '▲' : '▼'}</span>
+                    </button>
+                    <button onClick={() => setPairedBanner(null)} className="text-[11px] text-[#0055a5] hover:text-[#003d7a]">✕</button>
+                  </div>
+                  {pairedBannerExpanded && (
+                    <div className="flex flex-col gap-0.5 mt-2">
+                      {pairedBanner.map(item => (
+                        <div key={item.dodavatel} className="flex items-center gap-2 text-[13px] text-[#0055a5]">
+                          <span className="font-medium flex-1">{item.dodavatel}</span>
+                          <span className="text-[#3a7abf]">{item.count} {item.count === 1 ? 'faktura' : item.count < 5 ? 'faktury' : 'faktur'}</span>
+                          <span className="font-semibold">{fmt(item.castka)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })()}
 
             {!isTransakceTab && (loading ? (
               <div className="text-center py-20 text-[13px] text-gray-400">Načítám…</div>
@@ -826,7 +1155,7 @@ export default function Home() {
                       const isSoon = dl === 'Zítra' || (dl !== null && dl.startsWith('Za'))
                       const effectiveKategorieId = kategorieOverride.get(f.id) ?? f.kategorie_id ?? undefined
                       const kat = kategorieList.find(k => k.id === effectiveKategorieId)
-                      const suggestion = f.stav === 'schvalena' ? findMatch(f, transakce) : null
+                      const suggestion = f.stav === 'schvalena' ? (sequentialSuggestions.get(f.id) ?? null) : null
                       const pairedT = transakce.find(t => t.faktura_id === f.id && t.stav === 'sparovano')
                       const showPicker = activePicker === f.id
                       const isSchvalena = f.stav === 'schvalena'
@@ -1078,6 +1407,41 @@ export default function Home() {
               </div>
             ))}
 
+            {/* ===== CHYBĚJÍCÍ FAKTURY (Ke schválení tab) ===== */}
+            {tab === 'nova' && chybejici && chybejici.length > 0 && (
+              <div className="mt-6">
+                <div className="text-[12px] font-semibold text-red-600 uppercase tracking-wider mb-2">
+                  Pravděpodobně chybějící faktury — dodavatelé bez faktury v aktuálním měsíci
+                </div>
+                <div className="bg-white rounded-2xl shadow-sm border border-red-100 overflow-clip">
+                  <table className="w-full text-[13px]">
+                    <thead className="bg-red-50 border-b border-red-100">
+                      <tr>
+                        <th className="px-5 py-2.5 text-left text-[11px] font-semibold text-red-500 uppercase tracking-wide">Dodavatel</th>
+                        <th className="px-5 py-2.5 text-left text-[11px] font-semibold text-red-500 uppercase tracking-wide">Chybí za {['', 'Leden', 'Únor', 'Březen', 'Duben', 'Květen', 'Červen', 'Červenec', 'Srpen', 'Září', 'Říjen', 'Listopad', 'Prosinec'][new Date().getMonth() + 1]}</th>
+                        <th className="px-5 py-2.5 text-right text-[11px] font-semibold text-red-500 uppercase tracking-wide">Nesparované platby</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {chybejici.map(item => (
+                        <tr key={item.dodavatel} className="border-b border-gray-50 hover:bg-red-50/30">
+                          <td className="px-5 py-3 font-medium text-gray-800">{item.dodavatel}</td>
+                          <td className="px-5 py-3 text-gray-500 text-[12px]">
+                            Bylo: {item.months_present.map(m => ['', 'Led', 'Úno', 'Bře', 'Dub', 'Kvě', 'Čvn', 'Čvc', 'Srp', 'Zář', 'Říj', 'Lis', 'Pro'][m]).join(', ')}
+                          </td>
+                          <td className="px-5 py-3 text-right font-semibold text-gray-700">
+                            {item.nesparovana_castka > 0
+                              ? new Intl.NumberFormat('cs-CZ', { style: 'currency', currency: item.nesparovana_mena || item.mena || 'CZK', maximumFractionDigits: 0 }).format(item.nesparovana_castka)
+                              : <span className="text-gray-300">—</span>}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
             {/* ===== TRANSAKCE ZÁLOŽKY (Spárované / Nespárované) ===== */}
             {isTransakceTab && (() => {
               const baseList = transakce.filter(t => tab === 'sparovane' ? t.stav === 'sparovano' : t.stav === 'nesparovano')
@@ -1261,50 +1625,8 @@ export default function Home() {
           </div>
         )}
 
-        {tab === 'pravidla' && (
-          <div className="bg-white rounded-2xl shadow-sm border border-black/[0.06] overflow-clip">
-            <table className="w-full text-sm">
-              <thead className="bg-gray-50 border-b border-gray-100">
-                <tr>
-                  <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Dodavatel</th>
-                  <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Typ platby</th>
-                  <th className="px-5 py-3 text-center text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Auto párovat</th>
-                  <th className="px-5 py-3 text-left text-[11px] font-semibold text-gray-400 uppercase tracking-wide w-1/2">Pravidla zaúčtování</th>
-                </tr>
-              </thead>
-              <tbody>
-                {allSuppliers.map((p, i) => (
-                    <tr key={p.id} className={`border-b border-gray-50 hover:bg-gray-50/50 ${p._synthetic ? 'opacity-60' : ''}`}>
-                      <td className="px-5 py-3">
-                        <div className={`text-[13px] font-medium text-gray-900 ${p._synthetic ? '' : 'font-mono'}`}>{p.dodavatel_pattern}</div>
-                        {p.ico && <div className="text-[11px] text-gray-400 mt-0.5">IČO {p.ico}</div>}
-                        {p._synthetic && <div className="text-[10px] text-orange-500 mt-0.5">bez pravidla</div>}
-                      </td>
-                      <td className="px-5 py-3">
-                        {p.typ_platby ? (
-                          <span className={`inline-flex px-2 py-0.5 rounded-full text-[11px] font-medium ${
-                            p.typ_platby === 'karta' ? 'bg-blue-50 text-blue-700' :
-                            p.typ_platby === 'prevod' ? 'bg-purple-50 text-purple-700' :
-                            'bg-gray-100 text-gray-500'
-                          }`}>{p.typ_platby}</span>
-                        ) : <span className="text-gray-300">—</span>}
-                      </td>
-                      <td className="px-5 py-3 text-center">
-                        {!p._synthetic ? (
-                          <button
-                            onClick={() => togglePravidlo(p.id, 'auto_parovat', !p.auto_parovat)}
-                            className={`w-10 h-5 rounded-full transition-colors relative ${p.auto_parovat ? 'bg-green-500' : 'bg-gray-200'}`}
-                          >
-                            <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${p.auto_parovat ? 'translate-x-5' : 'translate-x-0.5'}`} />
-                          </button>
-                        ) : <span className="text-gray-300">—</span>}
-                      </td>
-                      <td className="px-5 py-3">{renderPravidloText(p.poznamka ?? null)}</td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
-          </div>
+        {tab === 'vykazy' && (
+          <VykazVysledovka />
         )}
 
         {/* ===== ABRA CHECK ===== */}
@@ -1514,6 +1836,68 @@ export default function Home() {
               </>)}
               {!abraLoading && !abraResult && (
                 <div className="text-center py-10 text-[13px] text-red-500">Chyba při načítání z ABRA</div>
+              )}
+            </div>
+
+            {/* Model B — full audit */}
+            <div className="border-t border-gray-100 pt-4">
+              <div className="flex items-center gap-3 mb-3">
+                <button
+                  onClick={loadAuditFull}
+                  disabled={auditFullLoading}
+                  className="px-3 py-1.5 rounded-lg bg-[#0071e3] text-white text-[12px] font-medium hover:bg-[#0077ed] disabled:opacity-50"
+                >
+                  {auditFullLoading ? 'Audituji…' : 'Spustit audit (Model B)'}
+                </button>
+                {auditFullResult && (
+                  <span className={`text-[12px] px-2 py-0.5 rounded-lg ${auditFullResult.audit?.ok === false ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
+                    {auditFullResult.audit?.ok === false ? `${auditFullResult.audit.rozdily?.length ?? 0} rozdílů` : 'OK'}
+                  </span>
+                )}
+              </div>
+              {auditFullResult && (
+                <div className="space-y-3">
+                  {/* Counts summary */}
+                  <div className="text-[12px] text-gray-500 bg-gray-50 rounded-lg px-3 py-2">
+                    SB: nova {auditFullResult.data.sb.nova} · schvalena {auditFullResult.data.sb.schvalena} · zaplacena {auditFullResult.data.sb.zaplacena} · zamitnuta {auditFullResult.data.sb.zamitnuta}
+                    {' · '}ABRA: faktury {auditFullResult.data.abra.faktury_fp} · banka {auditFullResult.data.abra.banka_celkem}
+                  </div>
+                  {/* Chybějící v ABRA */}
+                  {auditFullResult.data.rozdily.chybejici_v_abra.length > 0 && (
+                    <div>
+                      <div className="text-[11px] font-semibold text-red-600 uppercase tracking-wider mb-1">
+                        Chybí v ABRA ({auditFullResult.data.rozdily.chybejici_v_abra.length})
+                      </div>
+                      {auditFullResult.data.rozdily.chybejici_v_abra.map(f => (
+                        <div key={f.id} className="text-[12px] text-gray-700 py-0.5">
+                          [{f.stav}] {f.dodavatel} · {f.castka.toLocaleString('cs-CZ')} Kč · {f.ocekavany_kod}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {/* Osiřelé v ABRA */}
+                  {auditFullResult.data.rozdily['osirelé_v_abra'].length > 0 && (
+                    <div>
+                      <div className="text-[11px] font-semibold text-orange-600 uppercase tracking-wider mb-1">
+                        Osiřelé v ABRA ({auditFullResult.data.rozdily['osirelé_v_abra'].length})
+                      </div>
+                      {auditFullResult.data.rozdily['osirelé_v_abra'].map(kod => (
+                        <div key={kod} className="text-[12px] text-gray-700 py-0.5">{kod}</div>
+                      ))}
+                    </div>
+                  )}
+                  {/* Model B souhrn */}
+                  {auditFullResult.audit && (
+                    <div className={`rounded-lg px-3 py-2 text-[12px] ${auditFullResult.audit.ok === false ? 'bg-red-50' : 'bg-green-50'}`}>
+                      <div className="font-medium mb-1">{auditFullResult.audit.souhrn}</div>
+                      {auditFullResult.audit.rozdily?.map((r, i) => (
+                        <div key={i} className={`mt-1 ${r.typ === 'KRITICKÁ' ? 'text-red-700' : 'text-orange-700'}`}>
+                          <span className="font-semibold">[{r.typ}]</span> {r.popis} → {r.oprava}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           </div>

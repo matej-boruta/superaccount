@@ -12,7 +12,7 @@ const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY!
-const DRIVE_FOLDER_ID = '19uD7bGxQTbDLn57L4tpBtH-9bG4lYXl8'
+const DRIVE_FOLDER_ID = '1vCbrmWcLhDR54KVL0EHYaDLg2Qr2RCsM'
 
 const SB = {
   apikey: SUPABASE_KEY,
@@ -37,14 +37,25 @@ async function getAccessToken(refreshToken: string): Promise<string> {
   return data.access_token
 }
 
-async function listDriveFiles(accessToken: string): Promise<{ id: string; name: string; createdTime: string }[]> {
-  const query = encodeURIComponent(`'${DRIVE_FOLDER_ID}' in parents and mimeType='application/pdf' and trashed=false`)
+async function listFolderFiles(accessToken: string, folderId: string): Promise<{ id: string; name: string; createdTime: string }[]> {
+  const query = encodeURIComponent(`'${folderId}' in parents and trashed=false`)
   const res = await fetch(
-    `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,createdTime)&orderBy=createdTime desc&pageSize=50`,
+    `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,mimeType,createdTime)&supportsAllDrives=true&includeItemsFromAllDrives=true&pageSize=200`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   )
   const data = await res.json()
-  return data.files ?? []
+  const items: { id: string; name: string; mimeType: string; createdTime: string }[] = data.files ?? []
+
+  const pdfs = items.filter(f => f.mimeType === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'))
+  const subfolders = items.filter(f => f.mimeType === 'application/vnd.google-apps.folder')
+
+  // Recurse into subfolders
+  const subFiles = await Promise.all(subfolders.map(sf => listFolderFiles(accessToken, sf.id)))
+  return [...pdfs, ...subFiles.flat()]
+}
+
+async function listDriveFiles(accessToken: string): Promise<{ id: string; name: string; createdTime: string }[]> {
+  return listFolderFiles(accessToken, DRIVE_FOLDER_ID)
 }
 
 async function downloadDriveFile(accessToken: string, fileId: string): Promise<Buffer> {
@@ -143,9 +154,23 @@ export async function POST() {
       const pdfBase64 = pdfBuffer.toString('base64')
       const parsed = await parseWithClaude(pdfBase64)
 
+      const cisloFaktury = String(parsed.cislo_faktury ?? file.name.replace('.pdf', ''))
+
+      // Sekundární deduplikace podle cislo_faktury + dodavatel (různí dodavatelé mohou mít stejné číslo)
+      const dodavatelParsed = String(parsed.dodavatel ?? '')
+      const existByCisloRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/faktury?cislo_faktury=eq.${encodeURIComponent(cisloFaktury)}&dodavatel=eq.${encodeURIComponent(dodavatelParsed)}&select=id&limit=1`,
+        { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+      )
+      const existByCislo = await existByCisloRes.json()
+      if (Array.isArray(existByCislo) && existByCislo.length > 0) {
+        skipped.push(file.name)
+        continue
+      }
+
       const faktura = {
-        cislo_faktury: String(parsed.cislo_faktury ?? file.name.replace('.pdf', '')),
-        dodavatel: String(parsed.dodavatel ?? ''),
+        cislo_faktury: cisloFaktury,
+        dodavatel: dodavatelParsed,
         ico: parsed.ico ? String(parsed.ico) : null,
         popis: String(parsed.popis ?? ''),
         castka_s_dph: Number(parsed.castka_s_dph ?? 0),
