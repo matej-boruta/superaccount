@@ -1,10 +1,11 @@
 import { NextResponse } from 'next/server'
-import { callClaude, SYSTEM_AGENT } from '@/lib/claude'
+import { callClaude, SYSTEM_AGENT, SYSTEM_AUDIT } from '@/lib/claude'
 import { findBestPravidlo, logDecision } from '@/lib/rules'
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY!
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY!
 
 const SB = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
 
@@ -92,51 +93,144 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
     return NextResponse.json({ kategorie_id: null })
   }
 
-  const kategorieId = await classifyWithAI(f, kategorieList)
+  const aiResult = await classifyWithDualModel(f, kategorieList)
 
   await logDecision({
-    typ: kategorieId ? 'rozhodnuti' : 'eskalace',
+    typ: aiResult.kategorie_id ? 'rozhodnuti' : 'eskalace',
     vstup: { faktura_id: Number(id), dodavatel: f.dodavatel, ico: f.ico, castka: f.castka_s_dph },
-    vystup: { kategorie_id: kategorieId, zdroj: 'claude_ai', poznamka: 'První výskyt bez pravidla — označit k revizi' },
-    confidence: kategorieId ? 55 : 0,
+    vystup: {
+      kategorie_id: aiResult.kategorie_id,
+      zdroj: 'claude_ai',
+      model_a: aiResult.model_a,
+      audit: aiResult.audit,
+      poznamka: aiResult.audit?.poznamka ?? 'První výskyt bez pravidla — označit k revizi',
+    },
+    confidence: aiResult.confidence,
     pravidlo_zdroj: 'claude_ai',
     faktura_id: Number(id),
   })
 
-  if (!kategorieId) return NextResponse.json({ kategorie_id: null, source: 'claude_no_result' })
+  if (!aiResult.kategorie_id) return NextResponse.json({ kategorie_id: null, source: 'claude_no_result' })
 
-  await sbPatch(kategorieId)
-  return NextResponse.json({ kategorie_id: kategorieId, source: 'claude_ai', confidence: 55 })
+  await sbPatch(aiResult.kategorie_id)
+  return NextResponse.json({
+    kategorie_id: aiResult.kategorie_id,
+    source: 'claude_ai',
+    confidence: aiResult.confidence,
+    audit_souhlas: aiResult.audit?.souhlas ?? null,
+  })
 }
 
-async function classifyWithAI(
+type AuditResult = {
+  souhlas: boolean
+  confidence_korekce: number
+  kategorie_id_navrh: number | null
+  poznamka: string
+}
+
+async function classifyWithDualModel(
   f: { dodavatel?: string; popis?: string; castka_s_dph?: number; mena?: string },
   kategorieList: { id: number; l1: string; l2: string; popis_pro_ai: string }[]
-): Promise<number | null> {
-  if (!ANTHROPIC_API_KEY) return null
+): Promise<{ kategorie_id: number | null; confidence: number; model_a: Record<string, unknown>; audit: AuditResult | null }> {
+  if (!ANTHROPIC_API_KEY) return { kategorie_id: null, confidence: 0, model_a: {}, audit: null }
 
   const kategorieText = kategorieList
     .map(k => `ID ${k.id}: ${k.l1} / ${k.l2} – ${k.popis_pro_ai}`)
     .join('\n')
 
-  const text = await callClaude(
+  const fakturaText = `Dodavatel: ${f.dodavatel || '—'}\nPopis: ${f.popis || '—'}\nČástka: ${f.castka_s_dph} ${f.mena || 'CZK'}`
+
+  // Model A: reasoning — klasifikuje a zdůvodňuje
+  const modelAText = await callClaude(
     ANTHROPIC_API_KEY,
     [{
       role: 'user',
-      content: `Klasifikuj fakturu do správné kategorie. Odpověz POUZE číslem ID kategorie, nic jiného.
+      content: `Klasifikuj fakturu. Odpověz čistým JSON:
+{"kategorie_id": <číslo>, "confidence": <0-100>, "duvod": "<1 věta proč>"}
 
 Faktura:
-- Dodavatel: ${f.dodavatel || ''}
-- Popis: ${f.popis || ''}
-- Částka: ${f.castka_s_dph} ${f.mena || 'CZK'}
+${fakturaText}
 
-Dostupné kategorie:
+Kategorie:
 ${kategorieText}`,
     }],
-    { model: 'claude-haiku-4-5-20251001', maxTokens: 10, system: SYSTEM_AGENT }
+    { model: 'claude-haiku-4-5-20251001', maxTokens: 80, system: SYSTEM_AGENT }
   )
 
-  const id = parseInt(text ?? '')
-  if (isNaN(id) || id < 1 || id > kategorieList.length) return null
-  return id
+  let modelA: { kategorie_id: number; confidence: number; duvod: string } | null = null
+  try {
+    modelA = JSON.parse(modelAText?.match(/\{[\s\S]*\}/)?.[0] ?? '')
+  } catch { /* modelA zůstane null */ }
+
+  if (!modelA?.kategorie_id) return { kategorie_id: null, confidence: 0, model_a: {}, audit: null }
+
+  // Model B: GPT-4o-mini jako nezávislý auditor — jiná firma, jiné tréninková data
+  const auditText = await callOpenAIAudit(
+    `Zkontroluj toto účetní rozhodnutí:
+
+Faktura:
+${fakturaText}
+
+Rozhodnutí modelu A (Claude):
+- Kategorie ID: ${modelA.kategorie_id}
+- Zdůvodnění: ${modelA.duvod}
+- Confidence: ${modelA.confidence}%
+
+Zvolená kategorie: ${kategorieList.find(k => k.id === modelA!.kategorie_id)?.l1 ?? '?'} / ${kategorieList.find(k => k.id === modelA!.kategorie_id)?.l2 ?? '?'}
+
+Všechny kategorie:
+${kategorieText}`
+  )
+
+  let audit: AuditResult | null = null
+  try {
+    audit = JSON.parse(auditText?.match(/\{[\s\S]*\}/)?.[0] ?? '')
+  } catch { /* audit zůstane null */ }
+
+  // Finální confidence: Model A ± korekce auditora, floor 0, cap 84 (Claude AI nikdy ≥ 85)
+  const baseConf = modelA.confidence ?? 55
+  const korekce = audit?.confidence_korekce ?? 0
+  const finalConf = Math.max(0, Math.min(84, baseConf + korekce))
+
+  // Pokud audit nesouhlasí a navrhuje jinou kategorii → použij auditorův návrh
+  const finalKatId = (audit?.souhlas === false && audit?.kategorie_id_navrh)
+    ? audit.kategorie_id_navrh
+    : modelA.kategorie_id
+
+  return {
+    kategorie_id: finalKatId,
+    confidence: finalConf,
+    model_a: modelA,
+    audit,
+  }
+}
+
+async function callOpenAIAudit(userMessage: string): Promise<string | null> {
+  // Pokus o GPT-4o-mini — pokud selže (quota, nedostupnost), fallback na Claude Haiku
+  if (OPENAI_API_KEY) {
+    try {
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          max_tokens: 200,
+          messages: [
+            { role: 'system', content: SYSTEM_AUDIT },
+            { role: 'user', content: userMessage },
+          ],
+        }),
+      })
+      const data = await res.json()
+      const text = data?.choices?.[0]?.message?.content?.trim()
+      if (text) return text
+    } catch { /* fallback níže */ }
+  }
+
+  // Fallback: Claude Haiku jako Model B
+  return callClaude(
+    ANTHROPIC_API_KEY,
+    [{ role: 'user', content: userMessage }],
+    { model: 'claude-haiku-4-5-20251001', maxTokens: 200, system: SYSTEM_AUDIT }
+  )
 }
