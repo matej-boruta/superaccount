@@ -137,8 +137,18 @@ export async function POST() {
   const skipped: string[] = []
   const errors: string[] = []
 
+  // Typy dokumentů od SAB Finance, které se nepárují jako faktury
+  const SAB_SKIP_KEYWORDS = ['souhrnný doklad', 'výpis z klientského účtu', 'vypis z klientskeho uctu']
+
   for (const file of files) {
     try {
+      // Přeskoč interní SAB Finance dokumenty (nejde o faktury k úhradě)
+      const nameLower = file.name.toLowerCase()
+      if (SAB_SKIP_KEYWORDS.some(kw => nameLower.includes(kw))) {
+        skipped.push(file.name)
+        continue
+      }
+
       // Deduplikace — přeskoč pokud už v DB je
       const existRes = await fetch(
         `${SUPABASE_URL}/rest/v1/faktury?gdrive_file_id=eq.${file.id}&select=id&limit=1`,
