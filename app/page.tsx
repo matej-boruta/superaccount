@@ -1230,14 +1230,21 @@ export default function Home() {
                           </td>
                           {/* col: Kategorie */}
                           <td className="px-4 py-2.5" onClick={e => e.stopPropagation()}>
-                            {f.stav === 'nova' && kategorieList.length > 0 ? (
+                            {(f.stav === 'nova' || f.stav === 'zaplacena') && kategorieList.length > 0 ? (
                               <select
                                 value={effectiveKategorieId ?? ''}
-                                onChange={e => {
-                                  const next = new Map(kategorieOverride)
+                                onChange={async e => {
                                   const val = Number(e.target.value)
+                                  const next = new Map(kategorieOverride)
                                   if (val) next.set(f.id, val); else next.delete(f.id)
                                   setKategorieOverride(next)
+                                  if (f.stav === 'zaplacena' && val) {
+                                    await fetch(`/api/faktury/${f.id}/zmenit-kategorii`, {
+                                      method: 'PATCH',
+                                      headers: { 'Content-Type': 'application/json' },
+                                      body: JSON.stringify({ kategorie_id: val }),
+                                    })
+                                  }
                                 }}
                                 className={`text-[11px] rounded-lg px-2 py-1 border outline-none cursor-pointer max-w-[130px] ${
                                   kat ? 'bg-purple-50 border-purple-200 text-purple-800 font-medium' : 'bg-gray-50 border-gray-200 text-gray-400'
