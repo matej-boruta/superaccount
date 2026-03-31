@@ -76,6 +76,14 @@ export async function POST(req: Request) {
     faktura_id,
   })
 
+  // Auto-commit do gitu — zaznamená učení v historii
+  const commitMsg = `Pravidlo: ${finalDodavatel} → kat=${kategorie_id}, conf=95 (manuální korekce faktura ${faktura_id})`
+  fetch(`${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/agent/commit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: commitMsg, push: true, scope: ['pravidla'] }),
+  }).catch(() => { /* commit je best-effort, nesmí blokovat */ })
+
   return NextResponse.json({
     ok: true,
     pravidlo_ulozeno: finalDodavatel,

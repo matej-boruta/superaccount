@@ -74,5 +74,13 @@ export async function POST(req: Request) {
     body: JSON.stringify(payload),
   })
 
+  // Auto-commit — každá aktualizace manuálu se zaznamená v gitu
+  const commitMsg = `Manuál: sekce ${sekce} aktualizována (v${noveVerze}) — ${updated_by ?? 'agent'}`
+  fetch(`${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/agent/commit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: commitMsg, push: true, scope: ['manual'] }),
+  }).catch(() => { /* best-effort */ })
+
   return NextResponse.json({ ok: true, sekce, verze: noveVerze })
 }
