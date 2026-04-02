@@ -32,7 +32,7 @@ export async function POST(req: Request) {
     `&datum_vystaveni=gte.${year}-01-01&datum_vystaveni=lte.${year}-12-31` +
     `&kategorie_id=is.null` +
     `&select=id,dodavatel,ico,castka_s_dph,mena,popis,stav_workflow`,
-    { headers: SB }
+    { headers: { ...SB, Range: '0-9999' } }
   )
   const faktury: Record<string, unknown>[] = await res.json().catch(() => [])
 

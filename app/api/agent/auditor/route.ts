@@ -43,7 +43,7 @@ export async function POST(req: Request) {
       `?stav_workflow=eq.NEEDS_INFO` +
       `&datum_vystaveni=gte.${year}-01-01` +
       `&select=id,dodavatel,blocker,stav_workflow`,
-      { headers: SB }
+      { headers: { ...SB, Range: '0-9999' } }
     ),
   ])
 

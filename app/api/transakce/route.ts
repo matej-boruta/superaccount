@@ -10,7 +10,7 @@ export async function GET(req: Request) {
 
   const res = await fetch(
     `${SUPABASE_URL}/rest/v1/transakce?select=id,datum,castka,mena,zprava,variabilni_symbol,typ,stav,faktura_id,protiucet${rokFilter}&order=datum.desc`,
-    { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, Range: '0-9999' } }
   )
   return NextResponse.json(await res.json())
 }
