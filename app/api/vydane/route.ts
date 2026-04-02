@@ -4,9 +4,11 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
 const SB = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
 
-export async function GET() {
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url)
+  const rok = parseInt(searchParams.get('rok') ?? String(new Date().getFullYear()))
   const res = await fetch(
-    `${SUPABASE_URL}/rest/v1/faktury_vydane?select=*&order=datum_vystaveni.desc`,
+    `${SUPABASE_URL}/rest/v1/faktury_vydane?select=*&datum_vystaveni=gte.${rok}-01-01&datum_vystaveni=lte.${rok}-12-31&order=datum_vystaveni.desc`,
     { headers: SB }
   )
   const data = await res.json()

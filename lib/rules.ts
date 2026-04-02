@@ -183,7 +183,7 @@ export type NovePravidlo = {
   limit_auto_kc?: number
   parovat_keyword?: string | null
   confidence: number
-  zdroj: 'manual' | 'agent' | 'history' | 'cross_company'
+  zdroj: 'manual' | 'agent' | 'history' | 'cross_company' | 'rule_proposal_pending'
   poznamka?: string | null
 }
 

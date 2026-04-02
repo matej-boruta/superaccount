@@ -153,7 +153,7 @@ export async function GET() {
       shoda: {
         faktury_ok: fakturyDiff === 0,
         faktury_diff: fakturyDiff,
-        banka_ok: Math.abs(bankaDiff - deletedDuplicates.length) <= 5,
+        banka_ok: bankaDiff - deletedDuplicates.length === 0,
         banka_diff: bankaDiff - deletedDuplicates.length,
       },
       rozdily: {
@@ -168,18 +168,18 @@ export async function GET() {
       },
     }
 
-    const auditPrompt = `Proveď reconciliation účetnictví. Data:
+    const auditPrompt = `Proveď reconciliation. Supabase je jediný zdroj pravdy. ABRA je zákonný výstup — musí zrcadlit SB přesně.
 
-${JSON.stringify(reconciliationData, null, 2)}
+Data: ${JSON.stringify(reconciliationData, null, 2)}
 
-Pravidla pro hodnocení:
-- ABRA FP záznamy musí sedět s (zaplacena + schvalena) faktury v SB — tolerance 0
-- ABRA banka záznamy musí přibližně sedět s počtem spárovaných transakcí v SB — tolerance ±5 (duplicity z minulosti)
-- Faktury chybějící v ABRA = KRITICKÁ chyba
-- Osiřelé FP záznamy v ABRA = KRITICKÁ chyba (možné duplicity)
-- Velký rozdíl banka (> 50) = VAROVÁNÍ (staré duplicity před opravou idempotency)
+PRAVIDLA (bez výjimky):
+- Tolerance: 0. Jakýkoli rozdíl SB vs ABRA je chyba.
+- SB má záznam, ABRA nemá → KRITICKÉ: chybí zákonný výstup, daňové riziko.
+- ABRA má záznam, SB nemá → KRITICKÉ: fantomový záznam, přebytek v účetnictví.
+- Pokud shoda.faktury_ok=false nebo shoda.banka_ok=false → ok musí být false. Bez výjimky.
+- Neopravuj data v SB na základě ABRA — SB je pravda.
 
-Vrať JSON ve formátu pro reconciliation report.`
+Vrať JSON: { "ok": boolean, "rozdily": [{ "typ": "KRITICKÁ|VAROVÁNÍ", "popis": string, "oprava": string }], "souhrn": string }`
 
     const auditJson = await callClaude(
       ANTHROPIC_API_KEY,
@@ -196,14 +196,33 @@ Vrať JSON ve formátu pro reconciliation report.`
       }
     }
 
+    const dataOk = reconciliationData.shoda.faktury_ok && reconciliationData.shoda.banka_ok
+    const claudeSaidOk = auditResult && (auditResult as { ok?: boolean }).ok === true
+    const auditDiscrepancy = claudeSaidOk && !dataOk
+
+    // Log audit výsledek — pokud Claude řekl OK ale data říkají NE, logujeme korekci
+    const logEntries = [
+      {
+        typ: dataOk ? 'rozhodnuti' : 'korekce',
+        rezim: 'AUDITOR',
+        confidence: dataOk ? 90 : 0,
+        pravidlo_zdroj: 'audit_reconciliation',
+        feedback_type: auditDiscrepancy ? 'case_correction' : null,
+        vstup: { shoda: reconciliationData.shoda, sb: reconciliationData.sb, abra: reconciliationData.abra },
+        vystup: {
+          data_verdict: dataOk ? 'ok' : 'rozdily_nalezeny',
+          claude_verdict: claudeSaidOk ? 'ok' : 'rozdily',
+          discrepancy: auditDiscrepancy ? `AUDITOR řekl OK ale data: banka_diff=${reconciliationData.shoda.banka_diff}, faktury_diff=${reconciliationData.shoda.faktury_diff}` : null,
+          korekce: auditDiscrepancy ? 'AUDITOR prompt ignoroval číselné rozdíly — přidat explicitní číselné podmínky' : null,
+        },
+        zmena_stavu: dataOk ? 'AUDIT_OK' : 'AUDIT_ROZDILY',
+      },
+    ]
+
     await fetch(`${SUPABASE_URL}/rest/v1/agent_log`, {
       method: 'POST',
-      headers: { ...SB_HEADERS, Prefer: 'return=minimal' },
-      body: JSON.stringify({
-        typ: auditResult && (auditResult as { ok?: boolean }).ok === false ? 'reconciliation_chyba' : 'reconciliation_ok',
-        zprava: JSON.stringify({ data: reconciliationData, audit: auditResult }),
-        created_at: new Date().toISOString(),
-      }),
+      headers: { ...SB_HEADERS, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify(logEntries[0]),
     })
 
     return NextResponse.json({

@@ -12,7 +12,7 @@ const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY!
-const DRIVE_FOLDER_ID = '1vCbrmWcLhDR54KVL0EHYaDLg2Qr2RCsM'
+const DEFAULT_DRIVE_FOLDER_ID = '1vCbrmWcLhDR54KVL0EHYaDLg2Qr2RCsM'
 
 const SB = {
   apikey: SUPABASE_KEY,
@@ -54,8 +54,8 @@ async function listFolderFiles(accessToken: string, folderId: string): Promise<{
   return [...pdfs, ...subFiles.flat()]
 }
 
-async function listDriveFiles(accessToken: string): Promise<{ id: string; name: string; createdTime: string }[]> {
-  return listFolderFiles(accessToken, DRIVE_FOLDER_ID)
+async function listDriveFiles(accessToken: string, folderId: string): Promise<{ id: string; name: string; createdTime: string }[]> {
+  return listFolderFiles(accessToken, folderId)
 }
 
 async function downloadDriveFile(accessToken: string, fileId: string): Promise<Buffer> {
@@ -117,7 +117,11 @@ async function parseWithClaude(pdfBase64: string): Promise<Record<string, unknow
   }
 }
 
-export async function POST() {
+export async function POST(req: Request) {
+  let body: { folder_id?: string } = {}
+  try { body = await req.json() } catch { /* no body */ }
+  const folderId = body.folder_id ?? DEFAULT_DRIVE_FOLDER_ID
+
   const tokensRes = await fetch(`${SUPABASE_URL}/rest/v1/google_tokens?select=*`, {
     headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
   })
@@ -131,7 +135,7 @@ export async function POST() {
   }
 
   const accessToken = await getAccessToken(tokens[0].refresh_token)
-  const files = await listDriveFiles(accessToken)
+  const files = await listDriveFiles(accessToken, folderId)
 
   const imported: string[] = []
   const skipped: string[] = []

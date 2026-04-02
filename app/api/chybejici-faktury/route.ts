@@ -1,121 +1,156 @@
 /**
- * Detekuje faktury, které pravděpodobně chybí v aktuálním účetním období.
- * Logika: dodavatel měl faktury v předchozích měsících, ale v aktuálním měsíci žádná nepřišla.
- * Suma: součet nesparovaných odchozích plateb, kde zprava obsahuje jméno dodavatele.
+ * Detekuje faktury, které pravděpodobně chybí.
+ * Zdroj: nesparované odchozí platby — pro každou platbu hledáme, zda existuje faktura.
+ * Kontext: dodavatel je identifikován z dodavatel_pravidla nebo historických faktur (zprava match).
+ * Výstup: jeden řádek na dodavatele — měsíc platby, počet plateb, celková hodnota.
  */
 import { NextResponse } from 'next/server'
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
 
-const SB_HEADERS = {
+const SB = {
   apikey: SUPABASE_KEY,
   Authorization: `Bearer ${SUPABASE_KEY}`,
 }
 
-export async function GET() {
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url)
   const now = new Date()
-  const currentYear = now.getFullYear()
-  const currentMonth = now.getMonth() + 1 // 1-12
+  const rok = parseInt(searchParams.get('rok') ?? String(now.getFullYear()))
 
-  // Fetch all faktury from this year + nesparované odchozí transakce in parallel
-  const [fakturyRes, transakceRes] = await Promise.all([
+  // Fetch in parallel: nesparované odchozí transakce + všechny dodavatele z faktur roku + pravidla
+  const [transakceRes, fakturyRes, pravidlaRes] = await Promise.all([
     fetch(
-      `${SUPABASE_URL}/rest/v1/faktury?datum_vystaveni=gte.${currentYear}-01-01&select=id,dodavatel,castka_s_dph,mena,datum_vystaveni,stav&order=datum_vystaveni.asc`,
-      { headers: SB_HEADERS }
+      `${SUPABASE_URL}/rest/v1/transakce?stav=eq.nesparovano&castka=lt.0&datum=gte.${rok}-01-01&datum=lte.${rok}-12-31&select=id,castka,mena,zprava,datum&order=datum.asc`,
+      { headers: SB }
     ),
     fetch(
-      `${SUPABASE_URL}/rest/v1/transakce?stav=eq.nesparovano&castka=lt.0&select=id,castka,mena,zprava`,
-      { headers: SB_HEADERS }
+      `${SUPABASE_URL}/rest/v1/faktury?datum_vystaveni=gte.${rok}-01-01&datum_vystaveni=lte.${rok}-12-31&select=dodavatel,datum_vystaveni,castka_s_dph,mena`,
+      { headers: SB }
+    ),
+    fetch(
+      `${SUPABASE_URL}/rest/v1/dodavatel_pravidla?select=dodavatel,dodavatel_pattern`,
+      { headers: SB }
     ),
   ])
-
-  const faktury: {
-    id: number
-    dodavatel: string
-    castka_s_dph: number
-    mena: string
-    datum_vystaveni: string
-    stav: string
-  }[] = await fakturyRes.json()
 
   const transakce: {
     id: number
     castka: number
     mena: string
     zprava: string | null
+    datum: string
   }[] = await transakceRes.json()
 
-  if (!Array.isArray(faktury)) return NextResponse.json([])
-
-  // Group by supplier → months they appeared in
-  const supplierMonths = new Map<string, {
-    months: Set<number>
-    avgCastka: number
+  const faktury: {
+    dodavatel: string
+    datum_vystaveni: string
+    castka_s_dph: number
     mena: string
-    hasCurrentMonth: boolean
-    lastCastka: number
-  }>()
+  }[] = await fakturyRes.json()
 
-  for (const f of faktury) {
+  const pravidla: {
+    dodavatel: string
+    dodavatel_pattern: string
+  }[] = await pravidlaRes.json()
+
+  if (!Array.isArray(transakce) || transakce.length === 0) return NextResponse.json([])
+
+  // Build lookup: pattern → dodavatel name (from pravidla)
+  const pravidlaMap: { pattern: string; dodavatel: string }[] = Array.isArray(pravidla)
+    ? pravidla.filter(p => p.dodavatel_pattern).map(p => ({
+        pattern: p.dodavatel_pattern.replace(/%/g, '').toLowerCase(),
+        dodavatel: p.dodavatel,
+      }))
+    : []
+
+  // Build lookup: known dodavatelé from historical faktury (unique names)
+  const knownDodavatele: string[] = Array.isArray(faktury)
+    ? [...new Set(faktury.map(f => f.dodavatel).filter(Boolean))]
+    : []
+
+  // Build set of (dodavatel × month) that already have a faktura
+  const fakturyMonths = new Set<string>()
+  for (const f of Array.isArray(faktury) ? faktury : []) {
     if (!f.datum_vystaveni || !f.dodavatel) continue
-    const month = new Date(f.datum_vystaveni).getMonth() + 1
-    const prev = supplierMonths.get(f.dodavatel)
+    const m = new Date(f.datum_vystaveni).getMonth() + 1
+    fakturyMonths.add(`${f.dodavatel}|${m}`)
+  }
+
+  // For each transakce, identify dodavatel
+  function identifyDodavatel(zprava: string | null): string | null {
+    if (!zprava) return null
+    const zpravaLower = zprava.toLowerCase()
+
+    // 1. Match pravidla pattern
+    for (const p of pravidlaMap) {
+      if (p.pattern && zpravaLower.includes(p.pattern)) return p.dodavatel
+    }
+
+    // 2. Match known dodavatel names from historical faktury
+    for (const d of knownDodavatele) {
+      // Match at least first meaningful word (≥4 chars) of dodavatel name
+      const words = d.toLowerCase().split(/\s+/).filter(w => w.length >= 4)
+      if (words.length > 0 && words.some(w => zpravaLower.includes(w))) return d
+    }
+
+    return null
+  }
+
+  // Group unmatched payments by dodavatel+month (ne jen dodavatel)
+  // Bug fix: groupování jen po dodavateli způsobovalo, že jeden měsíc s fakturou
+  // vyfiltroval celého dodavatele — i měsíce kde faktura chybí
+  type Group = {
+    dodavatel: string
+    month: number
+    payments: { castka: number; mena: string; datum: string }[]
+    faktura_exists: boolean
+  }
+  const groups = new Map<string, Group>()
+
+  for (const t of transakce) {
+    const dodavatel = identifyDodavatel(t.zprava)
+    if (!dodavatel) continue
+
+    const month = new Date(t.datum).getMonth() + 1
+    const hasFaktura = fakturyMonths.has(`${dodavatel}|${month}`)
+
+    // Klíč = dodavatel + měsíc — každý měsíc hodnotíme zvlášť
+    const key = `${dodavatel}|${month}`
+    const prev = groups.get(key)
     if (!prev) {
-      supplierMonths.set(f.dodavatel, {
-        months: new Set([month]),
-        avgCastka: f.castka_s_dph,
-        mena: f.mena,
-        hasCurrentMonth: month === currentMonth,
-        lastCastka: f.castka_s_dph,
+      groups.set(key, {
+        dodavatel,
+        month,
+        payments: [{ castka: Math.abs(t.castka), mena: t.mena, datum: t.datum }],
+        faktura_exists: hasFaktura,
       })
     } else {
-      prev.months.add(month)
-      if (month === currentMonth) prev.hasCurrentMonth = true
-      prev.lastCastka = f.castka_s_dph
-      prev.avgCastka = (prev.avgCastka + f.castka_s_dph) / 2
+      prev.payments.push({ castka: Math.abs(t.castka), mena: t.mena, datum: t.datum })
+      if (hasFaktura) prev.faktura_exists = true
     }
   }
 
-  // Find suppliers with ≥2 previous months but missing current month
-  const missing: {
-    dodavatel: string
-    months_present: number[]
-    avg_castka: number
-    last_castka: number
-    mena: string
-    nesparovana_castka: number
-    nesparovana_mena: string
-  }[] = []
+  // Build result — only groups where no matching faktura exists for that month
+  const MONTH_NAMES = ['', 'Leden', 'Únor', 'Březen', 'Duben', 'Květen', 'Červen',
+    'Červenec', 'Srpen', 'Září', 'Říjen', 'Listopad', 'Prosinec']
 
-  for (const [dodavatel, info] of supplierMonths.entries()) {
-    const previousMonths = [...info.months].filter(m => m < currentMonth)
-    if (previousMonths.length >= 2 && !info.hasCurrentMonth) {
-      // Sum nesparované odchozí transakce whose zprava contains the supplier name
-      const dodavatelLower = dodavatel.toLowerCase()
-      let nesparovanaSum = 0
-      let nesparovatMena = info.mena
-      for (const t of Array.isArray(transakce) ? transakce : []) {
-        if (t.zprava && t.zprava.toLowerCase().includes(dodavatelLower)) {
-          nesparovanaSum += Math.abs(t.castka)
-          nesparovatMena = t.mena || nesparovatMena
-        }
+  const result = [...groups.values()]
+    .filter(g => !g.faktura_exists)
+    .map(g => {
+      const totalCastka = g.payments.reduce((s, p) => s + p.castka, 0)
+      const mena = g.payments[0]?.mena ?? 'CZK'
+      return {
+        dodavatel: g.dodavatel,
+        chybi_mesic: g.month,
+        chybi_mesic_nazev: MONTH_NAMES[g.month] ?? '',
+        nesparovana_count: g.payments.length,
+        nesparovana_castka: totalCastka,
+        nesparovana_mena: mena,
       }
+    })
+    .sort((a, b) => b.nesparovana_castka - a.nesparovana_castka)
 
-      missing.push({
-        dodavatel,
-        months_present: [...info.months].sort((a, b) => a - b),
-        avg_castka: info.avgCastka,
-        last_castka: info.lastCastka,
-        mena: info.mena,
-        nesparovana_castka: nesparovanaSum,
-        nesparovana_mena: nesparovatMena,
-      })
-    }
-  }
-
-  // Sort by last_castka desc (most important first)
-  missing.sort((a, b) => b.last_castka - a.last_castka)
-
-  return NextResponse.json(missing)
+  return NextResponse.json(result)
 }

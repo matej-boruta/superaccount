@@ -21,6 +21,8 @@ type Faktura = {
   datum_platby: string | null
   kategorie_id: number | null
   zauctovano_platba: boolean | null
+  stav_workflow?: string | null
+  blocker?: string | null
 }
 
 type Kategorie = {
@@ -195,18 +197,20 @@ type VysledovkaData = {
 
 const MESICE = ['', 'Led', 'Úno', 'Bře', 'Dub', 'Kvě', 'Čvn', 'Čvc', 'Srp', 'Zář', 'Říj', 'Lis', 'Pro']
 
-function VykazVysledovka() {
+function VykazVysledovka({ rok }: { rok: number }) {
   const [open, setOpen] = React.useState(false)
   const [loading, setLoading] = React.useState(false)
   const [data, setData] = React.useState<VysledovkaData | null>(null)
   const [error, setError] = React.useState<string | null>(null)
+
+  React.useEffect(() => { setData(null) }, [rok])
 
   const load = async () => {
     if (data) return  // already loaded
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch('/api/vykazy/vysledovka')
+      const res = await fetch(`/api/vykazy/vysledovka?rok=${rok}`)
       const d = await res.json()
       if (d.error) setError(d.error)
       else setData(d)
@@ -340,10 +344,12 @@ export default function Home() {
   const router = useRouter()
   const currentYear = new Date().getFullYear()
   const AVAILABLE_YEARS = [currentYear - 1, currentYear] // 2025, 2026 — rozšiř dle potřeby
-  const [selectedYear, setSelectedYear] = useState<number>(() => {
-    const p = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('rok') : null
-    return p ? parseInt(p) : currentYear
-  })
+  const [selectedYear, setSelectedYear] = useState<number>(currentYear)
+  useEffect(() => {
+    const p = new URLSearchParams(window.location.search).get('rok')
+    if (p && parseInt(p) !== currentYear) setSelectedYear(parseInt(p))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const [faktury, setFaktury] = useState<Faktura[]>([])
   const [loading, setLoading] = useState(true)
@@ -374,7 +380,7 @@ export default function Home() {
     const rok = year ?? selectedYear
     setLoading(true)
     const res = await fetch(`/api/faktury?rok=${rok}`)
-    const json = await res.json()
+    const json = res.ok ? await res.json().catch(() => []) : []
     const data: Faktura[] = Array.isArray(json) ? json : []
     setFaktury(data)
     setLoading(false)
@@ -456,6 +462,8 @@ export default function Home() {
   useEffect(() => {
     load(selectedYear)
     loadTransakce(undefined, selectedYear)
+    setVydane([])
+    setChybejici(null)
     // Update URL param
     const params = new URLSearchParams(window.location.search)
     params.set('rok', String(selectedYear))
@@ -567,8 +575,12 @@ export default function Home() {
   // ===== FAKTURY computed =====
   const isTransakceTab = tab === 'sparovane' || tab === 'nesparovane'
   const [chybejici, setChybejici] = useState<{
-    dodavatel: string; months_present: number[]; avg_castka: number; last_castka: number; mena: string
-    nesparovana_castka: number; nesparovana_mena: string
+    dodavatel: string
+    chybi_mesic: number
+    chybi_mesic_nazev: string
+    nesparovana_count: number
+    nesparovana_castka: number
+    nesparovana_mena: string
   }[] | null>(null)
   const filtered = (() => {
     const base = tab === 'vse' ? faktury : isTransakceTab ? [] : faktury.filter(f => f.stav === tab)
@@ -734,6 +746,132 @@ export default function Home() {
     banka?: { sbBezBanky: Array<{ sbId: number; dodavatel: string; castka: number; mena: string; datum: string }>; abraBankaBezSB: Array<{ id: string; popis: string; sumOsv: number; datVyst: string }> }
   } | null>(null)
 
+  const [historickyImport, setHistorickyImport] = useState<null | { status: string }>(null)
+
+  // ── PM Agent state ──────────────────────────────────────────────────────────
+  const [agentRunning, setAgentRunning] = useState(false)
+  const [agentLog, setAgentLog] = useState<{ type: 'action' | 'info' | 'warn'; text: string }[]>([])
+  const [agentSummary, setAgentSummary] = useState<string | null>(null)
+  // Orchestrator — spuštění konkrétního tasku
+  const [orchRunning, setOrchRunning] = useState<string | null>(null) // key = action string
+  const [orchResults, setOrchResults] = useState<Record<string, { ok: boolean; summary: string }>>({})
+
+  // Strategic Orchestrator
+  const [stratOrchRunning, setStratOrchRunning] = useState(false)
+  const [stratOrchData, setStratOrchData] = useState<{
+    year: number; dry_run: boolean; state: Record<string, unknown>
+    goals: Array<{ id: string; label: string; target: string; current: unknown; ok: boolean; urgency: string; action: string | null; owner: string }>
+    plan: Array<{ order: number; owner: string; task: string; urgency: string; why: string }>
+    execution: Array<{ step: number; owner: string; task: string; result: string; ok: boolean }>
+    system_health_pct: number; strategic_insight: string | null; summary: string; generated_at: string
+  } | null>(null)
+  const [agentQuestion, setAgentQuestion] = useState<{
+    otazka: string; kontext: string; moznosti: string[]
+    tool_use_id: string; messages: unknown[]
+  } | null>(null)
+  const [agentAnswer, setAgentAnswer] = useState('')
+  const [needsInfoCount, setNeedsInfoCount] = useState(0)
+  const [caseMeta, setCaseMeta] = useState<Record<number, { confidence: number; source_of_rule: string; rezim: string }>>({})
+
+  // ── Control Tower state ────────────────────────────────────────────────────
+  const [ctOpen, setCtOpen] = useState(false)
+  const [ctLoading, setCtLoading] = useState(false)
+  const [ctLoadingStep, setCtLoadingStep] = useState('')
+  const [ctData, setCtData] = useState<{
+    snapshot: Record<string, unknown>
+    analysis: {
+      system_health: { overall_score: number; accounting_quality: number; audit_quality: number; workflow_quality: number; data_quality: number; architecture_quality: number; learning_quality: number; summary: string }
+      kpi_by_agent: Array<{ agent_name: string; strongest_area: string; weakest_area: string; risk_level: string; performance_summary: string }>
+      critical_issues: Array<{ severity: string; type: string; owner_agent: string; title: string; symptom: string; root_cause: string; impact: string; recommended_fix: string }>
+      patterns: Array<{ description: string; trend: string }>
+      quick_wins: Array<{ action: string; effort: string; impact: string }>
+      strategic_improvements: Array<{ title: string; description: string; priority: string }>
+      orchestrator_tasking: {
+        action_list: Array<{ action: string; priority: string; owner_agent: string; type: string; description: string; expected_impact: string }>
+        system_decisions: { database: string[]; rules: string[]; prompts: string[]; workflow: string[] }
+        agent_task_assignments: { accountant: string[]; auditor: string[]; pm: string[]; architect: string[] }
+        learning_actions: string[]
+        top3_priorities: string[]
+      }
+    } | null
+    agent_errors: Array<{ id: number; typ: string; rezim: string; feedback_type: string | null; faktura_id: number | null; popis: string; korekce_popis: string | null; created_at: string }>
+    agent_trend: Record<string, Array<{ week: string; avg_confidence: number; decisions: number; acc_errors: number; auditor_false_neg: number; fixed: number; error_rate_pct: number }>>
+    agent_kpi: Record<string, { total_decisions: number; acc_errors: number; auditor_false_neg: number; fixed: number; error_rate_pct: number; fix_rate_pct: number }>
+    generated_at: string
+  } | null>(null)
+  const [ctTab, setCtTab] = useState<'dashboard' | 'tasking' | 'agent' | 'abra'>('dashboard')
+
+  // Orchestrator — routuje task ke správnému agentovi přes dispatcher
+  const runOrchestratorTask = async (actionKey: string, taskDescription: string, actionType: string, ownerAgent = 'pm') => {
+    if (orchRunning) return
+    setOrchRunning(actionKey)
+    try {
+      const res = await fetch('/api/agent/dispatch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          owner_agent: ownerAgent,
+          task: taskDescription,
+          type: actionType,
+          year: selectedYear,
+        }),
+      })
+      const data = await res.json()
+      const verif = data.verification
+      const verdict = verif?.verdict ?? data.summary ?? 'Hotovo'
+      const summary = verif
+        ? `${verdict} | before: bez_kat ${verif.before.faktury_bez_kategorie}→${verif.after.faktury_bez_kategorie}, needs_info ${verif.before.needs_info}→${verif.after.needs_info}`
+        : verdict
+      setOrchResults(prev => ({ ...prev, [actionKey]: { ok: data.ok !== false, summary } }))
+      if (data.log) setAgentLog(data.log)
+    } catch (e) {
+      setOrchResults(prev => ({ ...prev, [actionKey]: { ok: false, summary: String(e) } }))
+    }
+    setOrchRunning(null)
+  }
+
+  const runStrategicOrchestrator = async (dryRun = false) => {
+    if (stratOrchRunning) return
+    setStratOrchRunning(true)
+    try {
+      const res = await fetch('/api/agent/strategic-orchestrator', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ year: selectedYear, dry_run: dryRun }),
+      })
+      const data = await res.json()
+      setStratOrchData(data)
+    } catch { /* silent */ }
+    setStratOrchRunning(false)
+  }
+
+  const loadControlTower = async () => {
+    setCtLoading(true)
+    setCtLoadingStep('Načítám data z Supabase…')
+    try {
+      setCtLoadingStep('Spouštím Claude Haiku analýzu…')
+      const res = await fetch(`/api/agent/control-tower?rok=${selectedYear}`)
+      setCtLoadingStep('Zpracovávám výsledky…')
+      const data = await res.json()
+      setCtData(data)
+    } catch { /* silent */ }
+    setCtLoading(false)
+    setCtLoadingStep('')
+  }
+
+  useEffect(() => {
+    const fetchStatus = () =>
+      fetch('/api/agent/status').then(r => r.json()).then(d => setNeedsInfoCount(d.needs_info_count ?? 0)).catch(() => {})
+    fetchStatus()
+    const interval = setInterval(fetchStatus, 60_000)
+    return () => clearInterval(interval)
+  }, [])
+
+  useEffect(() => {
+    if (tab === 'nova') {
+      fetch(`/api/agent/case-meta?rok=${selectedYear}`).then(r => r.json()).then(d => setCaseMeta(d ?? {})).catch(() => {})
+    }
+  }, [tab, selectedYear])
   const [auditFullLoading, setAuditFullLoading] = useState(false)
   const [auditFullResult, setAuditFullResult] = useState<{
     data: {
@@ -747,6 +885,71 @@ export default function Home() {
     }
     audit: { ok: boolean; rozdily: Array<{ typ: string; popis: string; oprava: string }>; souhrn: string } | null
   } | null>(null)
+
+  const nacistHistorickaData = async (year: number) => {
+    setHistorickyImport({ status: 'Načítám faktury z Drive…' })
+    try {
+      const driveRes = await fetch('/api/google/sync-drive-faktury', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ folder_id: year === 2025 ? '1s5YxkO9ILZzvF4_nAnO26ucsF_GcnAAo' : '1vCbrmWcLhDR54KVL0EHYaDLg2Qr2RCsM' }),
+      })
+      const driveData = await driveRes.json()
+      setHistorickyImport({ status: `Faktury: ${driveData.imported ?? 0} nových. Načítám platby z Fio…` })
+
+      const fioRes = await fetch('/api/fio-import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dateFrom: `${year}-01-01`, dateTo: `${year}-12-31` }),
+      })
+      const fioData = await fioRes.json()
+      setHistorickyImport({ status: `Hotovo: ${driveData.imported ?? 0} faktur, ${fioData.totalSaved ?? 0} transakcí načteno.` })
+      load(year)
+      loadTransakce(undefined, year)
+    } catch (e) {
+      setHistorickyImport({ status: `Chyba: ${String(e)}` })
+    }
+  }
+
+  const runAgent = async (messages?: unknown[], toolUseId?: string, answer?: string) => {
+    setAgentRunning(true)
+    setAgentQuestion(null)
+    if (!messages) { setAgentLog([]); setAgentSummary(null) }
+    try {
+      const body: Record<string, unknown> = { year: selectedYear }
+      if (messages) body.messages = messages
+      if (toolUseId) body.tool_use_id = toolUseId
+      if (answer !== undefined) body.answer = answer
+
+      const res = await fetch('/api/agent/pm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await res.json()
+
+      setAgentLog(prev => [...prev, ...(data.log ?? [])])
+
+      if (data.type === 'question') {
+        setAgentQuestion({
+          otazka: data.otazka,
+          kontext: data.kontext,
+          moznosti: data.moznosti ?? [],
+          tool_use_id: data.tool_use_id,
+          messages: data.messages,
+        })
+      } else {
+        setAgentSummary(data.summary)
+        load(selectedYear)
+        loadTransakce(undefined, selectedYear)
+      }
+      // Refresh NEEDS_INFO badge po doběhnutí agenta
+      fetch('/api/agent/status').then(r => r.json()).then(d => setNeedsInfoCount(d.needs_info_count ?? 0)).catch(() => {})
+    } catch (e) {
+      setAgentLog(prev => [...prev, { type: 'warn', text: `Chyba: ${String(e)}` }])
+    }
+    setAgentRunning(false)
+  }
 
   const loadAuditFull = async () => {
     setAuditFullLoading(true)
@@ -788,9 +991,10 @@ export default function Home() {
     await loadAbraReconcile()
   }
 
-  const loadVydane = async () => {
+  const loadVydane = async (year?: number) => {
     setVydaneLoading(true)
-    const res = await fetch('/api/vydane')
+    const rok = year ?? selectedYear
+    const res = await fetch(`/api/vydane?rok=${rok}`)
     const data = await res.json()
     if (Array.isArray(data)) setVydane(data)
     setVydaneLoading(false)
@@ -799,10 +1003,11 @@ export default function Home() {
   useEffect(() => {
     if (tab === 'vydane') loadVydane()
     if (tab === 'abra') loadAbraReconcile()
-    if (tab === 'nova' && chybejici === null) {
-      fetch('/api/chybejici-faktury').then(r => r.json()).then(d => Array.isArray(d) && setChybejici(d)).catch(() => {})
+    if (tab === 'nova') {
+      setChybejici(null)
+      fetch(`/api/chybejici-faktury?rok=${selectedYear}`).then(r => r.json()).then(d => Array.isArray(d) && setChybejici(d)).catch(() => {})
     }
-  }, [tab])
+  }, [tab, selectedYear])
 
   const handleCsvImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -905,15 +1110,23 @@ export default function Home() {
             </div>
           </div>
           <div className="flex items-center gap-3">
+            {historickyImport && (
+              <span className="text-[12px] text-gray-500 animate-pulse">{historickyImport.status}</span>
+            )}
             {classifying && (
               <span className="text-[12px] text-gray-400 animate-pulse">Klasifikuji kategorie…</span>
             )}
             <button
-              onClick={loadAuditFull}
-              disabled={auditFullLoading}
-              className="text-[12px] px-3 py-1 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50 disabled:opacity-50 font-medium"
+              onClick={() => { setCtOpen(true); if (!ctData) loadControlTower() }}
+              suppressHydrationWarning
+              className="relative text-[12px] px-3 py-1 rounded-lg bg-[#0071e3] text-white hover:bg-[#0077ed] font-medium"
             >
-              {auditFullLoading ? 'Audituji…' : 'Audit účetnictví'}
+              Control Tower
+              {needsInfoCount > 0 && (
+                <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-[16px] px-0.5 rounded-full bg-red-500 text-white text-[9px] font-bold flex items-center justify-center">
+                  {needsInfoCount}
+                </span>
+              )}
             </button>
             <button
               onClick={() => { load(); loadTransakce() }}
@@ -929,11 +1142,11 @@ export default function Home() {
 
         {/* ── Audit výsledek ── */}
         {auditFullResult && (
-          <div className={`mb-4 rounded-xl px-4 py-3 text-[13px] ${auditFullResult.audit?.ok === false ? 'bg-red-50 border border-red-200' : 'bg-green-50 border border-green-200'}`}>
+          <div className={`mb-4 rounded-xl px-4 py-3 text-[13px] ${!(auditFullResult.data.shoda.faktury_ok && auditFullResult.data.shoda.banka_ok) ? 'bg-red-50 border border-red-200' : 'bg-green-50 border border-green-200'}`}>
             <div className="flex items-start justify-between gap-3">
               <div className="flex-1">
-                <span className={`font-semibold mr-2 ${auditFullResult.audit?.ok === false ? 'text-red-700' : 'text-green-700'}`}>
-                  Audit účetnictví {auditFullResult.audit?.ok === false ? '— nalezeny rozdíly' : '— vše v pořádku'}
+                <span className={`font-semibold mr-2 ${!(auditFullResult.data.shoda.faktury_ok && auditFullResult.data.shoda.banka_ok) ? 'text-red-700' : 'text-green-700'}`}>
+                  Audit účetnictví {!(auditFullResult.data.shoda.faktury_ok && auditFullResult.data.shoda.banka_ok) ? '— nalezeny rozdíly' : '— vše v pořádku'}
                 </span>
                 <span className="text-gray-500">
                   Faktury: aplikace {auditFullResult.data.sb.faktury_v_abra} (zaplacené + čekající) · ABRA {auditFullResult.data.abra.faktury_fp} FP
@@ -943,7 +1156,7 @@ export default function Home() {
                   {' · '}
                   Platby: aplikace {auditFullResult.data.sb.sparovane_transakce} spárovaných · ABRA {auditFullResult.data.abra.banka_celkem} banka
                   {auditFullResult.data.shoda.banka_diff !== 0 && (
-                    <span className={`font-medium ${Math.abs(auditFullResult.data.shoda.banka_diff) > 50 ? 'text-orange-600' : 'text-gray-400'}`}> ({auditFullResult.data.shoda.banka_diff > 0 ? '+' : ''}{auditFullResult.data.shoda.banka_diff})</span>
+                    <span className="font-medium text-red-600"> ({auditFullResult.data.shoda.banka_diff > 0 ? '+' : ''}{auditFullResult.data.shoda.banka_diff} — SB≠ABRA, tolerance 0)</span>
                   )}
                 </span>
                 {auditFullResult.audit?.souhrn && (
@@ -1226,9 +1439,17 @@ export default function Home() {
                               {isOverdue && (
                                 <span className="flex-shrink-0 inline-flex items-center justify-center w-[18px] h-[18px] rounded-full bg-red-500 text-white text-[9px] font-bold">!</span>
                               )}
+                              {f.stav_workflow === 'NEEDS_INFO' && (
+                                <span className="flex-shrink-0 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[9px] font-bold" title={f.blocker ?? 'Čeká na odpověď'}>
+                                  ? čeká
+                                </span>
+                              )}
                               <div className={`text-[13px] font-medium ${isSchvalena ? 'text-gray-400' : 'text-gray-900'}`}>{f.dodavatel}</div>
                             </div>
                             <div className="text-[11px] text-gray-400">IČO {f.ico}</div>
+                            {f.stav_workflow === 'NEEDS_INFO' && f.blocker && (
+                              <div className="text-[10px] text-amber-600 mt-0.5 line-clamp-1">{f.blocker}</div>
+                            )}
                           </td>
                           {/* col: Faktura / VS */}
                           <td className="px-4 py-2.5">
@@ -1311,10 +1532,21 @@ export default function Home() {
                                   className="px-3 py-1.5 text-[12px] font-medium text-red-600 bg-red-50 rounded-[8px] hover:bg-red-100 disabled:opacity-40">
                                   Zamítnout
                                 </button>
-                                <button onClick={() => schvalitAZaplatit(f.id, kategorieOverride.get(f.id) ?? f.kategorie_id ?? undefined)} disabled={processing}
-                                  className="px-3 py-1.5 text-[12px] font-medium text-white bg-[#0071e3] rounded-[8px] hover:bg-[#0077ed] disabled:opacity-40 whitespace-nowrap">
-                                  Schválit
-                                </button>
+                                <div className="flex flex-col items-end gap-0.5">
+                                  <button onClick={() => schvalitAZaplatit(f.id, kategorieOverride.get(f.id) ?? f.kategorie_id ?? undefined)} disabled={processing}
+                                    className="px-3 py-1.5 text-[12px] font-medium text-white bg-[#0071e3] rounded-[8px] hover:bg-[#0077ed] disabled:opacity-40 whitespace-nowrap">
+                                    Schválit
+                                  </button>
+                                  {caseMeta[f.id] && (
+                                    <span className={`text-[9px] font-medium px-1.5 py-0.5 rounded ${
+                                      caseMeta[f.id].confidence >= 85 ? 'bg-green-50 text-green-600' :
+                                      caseMeta[f.id].confidence >= 60 ? 'bg-amber-50 text-amber-600' :
+                                      'bg-red-50 text-red-500'
+                                    }`} title={caseMeta[f.id].source_of_rule}>
+                                      {caseMeta[f.id].confidence}% · {caseMeta[f.id].source_of_rule || caseMeta[f.id].rezim}
+                                    </span>
+                                  )}
+                                </div>
                               </>)}
                               {f.stav === 'schvalena' && (<>
                                 <button onClick={() => setActivePicker(showPicker ? null : f.id)}
@@ -1450,28 +1682,26 @@ export default function Home() {
             {tab === 'nova' && chybejici && chybejici.length > 0 && (
               <div className="mt-6">
                 <div className="text-[12px] font-semibold text-red-600 uppercase tracking-wider mb-2">
-                  Pravděpodobně chybějící faktury — dodavatelé bez faktury v aktuálním měsíci
+                  Pravděpodobně chybějící faktury — odchozí platby bez spárované faktury
                 </div>
                 <div className="bg-white rounded-2xl shadow-sm border border-red-100 overflow-clip">
                   <table className="w-full text-[13px]">
                     <thead className="bg-red-50 border-b border-red-100">
                       <tr>
                         <th className="px-5 py-2.5 text-left text-[11px] font-semibold text-red-500 uppercase tracking-wide">Dodavatel</th>
-                        <th className="px-5 py-2.5 text-left text-[11px] font-semibold text-red-500 uppercase tracking-wide">Chybí za {['', 'Leden', 'Únor', 'Březen', 'Duben', 'Květen', 'Červen', 'Červenec', 'Srpen', 'Září', 'Říjen', 'Listopad', 'Prosinec'][new Date().getMonth() + 1]}</th>
-                        <th className="px-5 py-2.5 text-right text-[11px] font-semibold text-red-500 uppercase tracking-wide">Nesparované platby</th>
+                        <th className="px-5 py-2.5 text-left text-[11px] font-semibold text-red-500 uppercase tracking-wide">Chybí</th>
+                        <th className="px-5 py-2.5 text-right text-[11px] font-semibold text-red-500 uppercase tracking-wide">Počet plateb</th>
+                        <th className="px-5 py-2.5 text-right text-[11px] font-semibold text-red-500 uppercase tracking-wide">Hodnota plateb</th>
                       </tr>
                     </thead>
                     <tbody>
                       {chybejici.map(item => (
                         <tr key={item.dodavatel} className="border-b border-gray-50 hover:bg-red-50/30">
                           <td className="px-5 py-3 font-medium text-gray-800">{item.dodavatel}</td>
-                          <td className="px-5 py-3 text-gray-500 text-[12px]">
-                            Bylo: {item.months_present.map(m => ['', 'Led', 'Úno', 'Bře', 'Dub', 'Kvě', 'Čvn', 'Čvc', 'Srp', 'Zář', 'Říj', 'Lis', 'Pro'][m]).join(', ')}
-                          </td>
+                          <td className="px-5 py-3 text-gray-700 text-[12px] font-medium">{item.chybi_mesic_nazev}</td>
+                          <td className="px-5 py-3 text-right text-gray-600">{item.nesparovana_count}</td>
                           <td className="px-5 py-3 text-right font-semibold text-gray-700">
-                            {item.nesparovana_castka > 0
-                              ? new Intl.NumberFormat('cs-CZ', { style: 'currency', currency: item.nesparovana_mena || item.mena || 'CZK', maximumFractionDigits: 0 }).format(item.nesparovana_castka)
-                              : <span className="text-gray-300">—</span>}
+                            {new Intl.NumberFormat('cs-CZ', { style: 'currency', currency: item.nesparovana_mena || 'CZK', maximumFractionDigits: 0 }).format(item.nesparovana_castka)}
                           </td>
                         </tr>
                       ))}
@@ -1665,7 +1895,7 @@ export default function Home() {
         )}
 
         {tab === 'vykazy' && (
-          <VykazVysledovka />
+          <VykazVysledovka rok={selectedYear} />
         )}
 
         {/* ===== ABRA CHECK ===== */}
@@ -1878,63 +2108,109 @@ export default function Home() {
               )}
             </div>
 
-            {/* Model B — full audit */}
-            <div className="border-t border-gray-100 pt-4">
-              <div className="flex items-center gap-3 mb-3">
+            {/* Audit — AUDITOR spouští, ACCOUNTANT opravuje, ARCHITECT verifikuje */}
+            <div className="border-t border-gray-100 pt-4 space-y-4">
+              <div className="flex items-center gap-3">
                 <button
                   onClick={loadAuditFull}
                   disabled={auditFullLoading}
                   className="px-3 py-1.5 rounded-lg bg-[#0071e3] text-white text-[12px] font-medium hover:bg-[#0077ed] disabled:opacity-50"
                 >
-                  {auditFullLoading ? 'Audituji…' : 'Spustit audit (Model B)'}
+                  {auditFullLoading ? 'Audituji…' : 'Spustit audit'}
                 </button>
                 {auditFullResult && (
-                  <span className={`text-[12px] px-2 py-0.5 rounded-lg ${auditFullResult.audit?.ok === false ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
-                    {auditFullResult.audit?.ok === false ? `${auditFullResult.audit.rozdily?.length ?? 0} rozdílů` : 'OK'}
+                  <span className={`text-[12px] px-2 py-0.5 rounded-lg font-medium ${!(auditFullResult.data.shoda.faktury_ok && auditFullResult.data.shoda.banka_ok) ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
+                    {!(auditFullResult.data.shoda.faktury_ok && auditFullResult.data.shoda.banka_ok)
+                      ? `AUDITOR: rozdíly nalezeny (banka ${auditFullResult.data.shoda.banka_diff > 0 ? '+' : ''}${auditFullResult.data.shoda.banka_diff}, faktury ${auditFullResult.data.shoda.faktury_diff > 0 ? '+' : ''}${auditFullResult.data.shoda.faktury_diff})`
+                      : 'AUDITOR: vše v pořádku'}
                   </span>
                 )}
               </div>
+
               {auditFullResult && (
                 <div className="space-y-3">
-                  {/* Counts summary */}
-                  <div className="text-[12px] text-gray-500 bg-gray-50 rounded-lg px-3 py-2">
-                    SB: nova {auditFullResult.data.sb.nova} · schvalena {auditFullResult.data.sb.schvalena} · zaplacena {auditFullResult.data.sb.zaplacena} · zamitnuta {auditFullResult.data.sb.zamitnuta}
-                    {' · '}ABRA: faktury {auditFullResult.data.abra.faktury_fp} · banka {auditFullResult.data.abra.banka_celkem}
+                  {/* Counts */}
+                  <div className="text-[12px] text-gray-500 bg-gray-50 rounded-lg px-3 py-2 flex flex-wrap gap-x-4 gap-y-1">
+                    <span>SB: nova <b>{auditFullResult.data.sb.nova}</b> · schvalena <b>{auditFullResult.data.sb.schvalena}</b> · zaplacena <b>{auditFullResult.data.sb.zaplacena}</b></span>
+                    <span>ABRA: FP faktury <b>{auditFullResult.data.abra.faktury_fp}</b> · banka doklady <b>{auditFullResult.data.abra.banka_celkem}</b></span>
+                    {/* duplicity_smazany shown if present */}
                   </div>
-                  {/* Chybějící v ABRA */}
+
+                  {/* Chybějící v ABRA — ACCOUNTANT opravuje */}
                   {auditFullResult.data.rozdily.chybejici_v_abra.length > 0 && (
-                    <div>
-                      <div className="text-[11px] font-semibold text-red-600 uppercase tracking-wider mb-1">
-                        Chybí v ABRA ({auditFullResult.data.rozdily.chybejici_v_abra.length})
-                      </div>
-                      {auditFullResult.data.rozdily.chybejici_v_abra.map(f => (
-                        <div key={f.id} className="text-[12px] text-gray-700 py-0.5">
-                          [{f.stav}] {f.dodavatel} · {f.castka.toLocaleString('cs-CZ')} Kč · {f.ocekavany_kod}
+                    <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3">
+                      <div className="flex items-center justify-between mb-2">
+                        <div>
+                          <div className="text-[11px] font-bold text-red-700 uppercase tracking-wider">
+                            ACCOUNTANT — chybí v ABRA ({auditFullResult.data.rozdily.chybejici_v_abra.length})
+                          </div>
+                          <div className="text-[11px] text-red-500 mt-0.5">Faktury zaplacené/schválené v aplikaci, ale nejsou jako FP záznamy v ABRA</div>
                         </div>
-                      ))}
+                        <button
+                          onClick={() => abraFix('create-in-abra-bulk')}
+                          disabled={abraFixing !== null}
+                          className="px-3 py-1.5 text-[12px] font-medium text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-40 whitespace-nowrap"
+                        >
+                          {abraFixing === 'create-in-abra-bulk' ? 'Vytvářím…' : `Vytvořit vše v ABRA (${auditFullResult.data.rozdily.chybejici_v_abra.length})`}
+                        </button>
+                      </div>
+                      <div className="space-y-1">
+                        {auditFullResult.data.rozdily.chybejici_v_abra.map(f => (
+                          <div key={f.id} className="flex items-center justify-between text-[12px]">
+                            <span className="text-red-800 font-medium">{f.dodavatel}</span>
+                            <span className="text-gray-600">{f.castka.toLocaleString('cs-CZ')} Kč · {f.ocekavany_kod} · <span className="text-gray-400">{f.stav}</span></span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   )}
-                  {/* Osiřelé v ABRA */}
+
+                  {/* Osiřelé v ABRA — ACCOUNTANT opravuje */}
                   {auditFullResult.data.rozdily['osirelé_v_abra'].length > 0 && (
-                    <div>
-                      <div className="text-[11px] font-semibold text-orange-600 uppercase tracking-wider mb-1">
-                        Osiřelé v ABRA ({auditFullResult.data.rozdily['osirelé_v_abra'].length})
+                    <div className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3">
+                      <div className="text-[11px] font-bold text-orange-700 uppercase tracking-wider mb-1">
+                        ACCOUNTANT — osiřelé v ABRA ({auditFullResult.data.rozdily['osirelé_v_abra'].length})
                       </div>
-                      {auditFullResult.data.rozdily['osirelé_v_abra'].map(kod => (
-                        <div key={kod} className="text-[12px] text-gray-700 py-0.5">{kod}</div>
-                      ))}
+                      <div className="text-[11px] text-orange-500 mb-2">FP záznamy v ABRA bez odpovídající faktury v aplikaci — pravděpodobné duplicity</div>
+                      <div className="space-y-0.5">
+                        {auditFullResult.data.rozdily['osirelé_v_abra'].map(kod => (
+                          <div key={kod} className="text-[12px] text-orange-800">{kod}</div>
+                        ))}
+                      </div>
                     </div>
                   )}
-                  {/* Model B souhrn */}
-                  {auditFullResult.audit && (
-                    <div className={`rounded-lg px-3 py-2 text-[12px] ${auditFullResult.audit.ok === false ? 'bg-red-50' : 'bg-green-50'}`}>
-                      <div className="font-medium mb-1">{auditFullResult.audit.souhrn}</div>
-                      {auditFullResult.audit.rozdily?.map((r, i) => (
-                        <div key={i} className={`mt-1 ${r.typ === 'KRITICKÁ' ? 'text-red-700' : 'text-orange-700'}`}>
-                          <span className="font-semibold">[{r.typ}]</span> {r.popis} → {r.oprava}
-                        </div>
-                      ))}
+
+                  {/* Banka diff — pokud existuje */}
+                  {!auditFullResult.data.shoda.banka_ok && (
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
+                      <div className="text-[11px] font-bold text-amber-700 uppercase tracking-wider mb-1">
+                        ARCHITECT — datový rozdíl banka ({auditFullResult.data.shoda.banka_diff > 0 ? '+' : ''}{auditFullResult.data.shoda.banka_diff})
+                      </div>
+                      <div className="text-[11px] text-amber-600 mb-2">
+                        SB spárováno: {auditFullResult.data.sb.sparovane_transakce} · ABRA banka doklady: {auditFullResult.data.abra.banka_celkem}
+                        {' '}· Rozdíl přesahuje toleranci ±2 — nutná datová kontrola
+                      </div>
+                      <button
+                        onClick={() => { setCtOpen(true); if (!ctData) loadControlTower() }}
+                        className="text-[11px] px-3 py-1 rounded-lg bg-amber-100 border border-amber-300 text-amber-800 hover:bg-amber-200 font-medium"
+                      >
+                        Otevřít ARCHITECT v Control Tower →
+                      </button>
                     </div>
+                  )}
+
+                  {/* Claude souhrn */}
+                  {auditFullResult.audit?.souhrn && (
+                    <div className="text-[11px] text-gray-500 px-3 py-2 bg-gray-50 rounded-lg">
+                      <span className="font-medium text-gray-600">AI souhrn:</span> {auditFullResult.audit.souhrn}
+                    </div>
+                  )}
+
+                  {/* All ok */}
+                  {auditFullResult.data.shoda.faktury_ok && auditFullResult.data.shoda.banka_ok &&
+                   auditFullResult.data.rozdily.chybejici_v_abra.length === 0 &&
+                   auditFullResult.data.rozdily['osirelé_v_abra'].length === 0 && (
+                    <div className="text-center py-3 text-[13px] text-green-600 font-medium">Vše sedí — žádné rozdíly</div>
                   )}
                 </div>
               )}
@@ -1943,6 +2219,832 @@ export default function Home() {
         )}
 
       </main>
+
+      {/* ── Control Tower panel ─────────────────────────────────────────── */}
+      {ctOpen && (
+        <div className="fixed inset-0 z-50 flex justify-end">
+          <div className="absolute inset-0 bg-black/20" onClick={() => !agentRunning && setCtOpen(false)} />
+          <div className="relative w-full max-w-2xl bg-white shadow-2xl flex flex-col h-full">
+
+            {/* Header */}
+            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 bg-white">
+              <div>
+                <div className="text-[14px] font-semibold text-gray-900">Control Tower</div>
+                <div className="text-[11px] text-gray-400">Agent Control Tower — SuperAccount {selectedYear}</div>
+              </div>
+              <div className="flex items-center gap-3">
+                <button onClick={() => { loadControlTower(); loadAbraReconcile() }} disabled={ctLoading}
+                  className="text-[11px] px-2.5 py-1 rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50 disabled:opacity-40">
+                  {ctLoading ? 'Analyzuji…' : 'Obnovit'}
+                </button>
+                <button onClick={() => setCtOpen(false)} className="text-gray-400 hover:text-gray-600 text-[18px]">✕</button>
+              </div>
+            </div>
+
+            {/* Tab switcher */}
+            <div className="flex border-b border-gray-100 bg-gray-50/50 overflow-x-auto">
+              {(['dashboard', 'tasking', 'abra', 'agent'] as const).map(t => {
+                const label = t === 'dashboard' ? 'Dashboard' : t === 'tasking' ? 'Orchestrátor' : t === 'abra' ? 'ABRA sync' : 'PM Agent'
+                const hasAbra = t === 'abra' && abraResult && (!abraResult.diff?.length === false || abraResult.onlySB?.length > 0)
+                const abraBad = t === 'abra' && abraResult && (abraResult.diff?.length > 0 || abraResult.onlySB?.length > 0 || abraResult.onlyABRA?.length > 0)
+                return (
+                  <button key={t}
+                    onClick={() => { setCtTab(t); if (t === 'abra' && !abraResult) loadAbraReconcile() }}
+                    className={`px-4 py-2.5 text-[12px] font-medium border-b-2 transition-colors whitespace-nowrap ${
+                      ctTab === t ? 'border-[#0071e3] text-[#0071e3]' : 'border-transparent text-gray-500 hover:text-gray-700'
+                    }`}>
+                    {label}
+                    {t === 'agent' && needsInfoCount > 0 && (
+                      <span className="ml-1.5 inline-flex items-center justify-center min-w-[14px] h-[14px] px-0.5 rounded-full bg-red-500 text-white text-[9px] font-bold">{needsInfoCount}</span>
+                    )}
+                    {abraBad && (
+                      <span className="ml-1.5 inline-flex items-center justify-center min-w-[14px] h-[14px] px-0.5 rounded-full bg-orange-500 text-white text-[9px] font-bold">!</span>
+                    )}
+                    {t === 'abra' && abraResult && !abraBad && (
+                      <span className="ml-1 text-green-500 text-[10px]">✓</span>
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+
+            {/* Content */}
+            <div className="flex-1 overflow-y-auto">
+
+              {/* Loading */}
+              {ctLoading && (
+                <div className="flex flex-col items-center justify-center h-full gap-3">
+                  <div className="w-8 h-8 border-2 border-[#0071e3] border-t-transparent rounded-full animate-spin" />
+                  <div className="text-[13px] text-gray-500 animate-pulse">{ctLoadingStep || 'Analyzuji…'}</div>
+                  <div className="text-[11px] text-gray-300">Claude Haiku · ~5–10s</div>
+                </div>
+              )}
+
+              {/* ── DASHBOARD TAB ── */}
+              {!ctLoading && ctTab === 'dashboard' && ctData?.analysis && (() => {
+                const { system_health: sh, kpi_by_agent, critical_issues, patterns, quick_wins, strategic_improvements } = ctData.analysis
+                const scoreColor = (s: number) => s >= 80 ? 'text-green-600' : s >= 60 ? 'text-amber-600' : 'text-red-600'
+                const scoreBg = (s: number) => s >= 80 ? 'bg-green-50' : s >= 60 ? 'bg-amber-50' : 'bg-red-50'
+                const riskColor = (r: string) => r === 'critical' ? 'bg-red-100 text-red-700' : r === 'high' ? 'bg-orange-100 text-orange-700' : r === 'medium' ? 'bg-amber-100 text-amber-700' : 'bg-green-100 text-green-700'
+                const sevColor = (s: string) => s === 'critical' ? 'text-red-600 bg-red-50 border-red-200' : s === 'high' ? 'text-orange-600 bg-orange-50 border-orange-200' : s === 'medium' ? 'text-amber-600 bg-amber-50 border-amber-200' : 'text-gray-500 bg-gray-50 border-gray-200'
+                return (
+                  <div className="px-5 py-5 space-y-6">
+
+                    {/* Overall score */}
+                    <div className={`rounded-2xl p-5 ${scoreBg(sh.overall_score)}`}>
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">System Health</span>
+                        <span className={`text-[32px] font-bold ${scoreColor(sh.overall_score)}`}>{sh.overall_score}</span>
+                      </div>
+                      <p className="text-[13px] text-gray-600">{sh.summary}</p>
+                      <div className="mt-3 grid grid-cols-3 gap-2">
+                        {[
+                          ['Accounting', sh.accounting_quality],
+                          ['Audit', sh.audit_quality],
+                          ['Workflow', sh.workflow_quality],
+                          ['Data', sh.data_quality],
+                          ['Architecture', sh.architecture_quality],
+                          ['Learning', sh.learning_quality],
+                        ].map(([label, val]) => (
+                          <div key={String(label)} className="bg-white/60 rounded-xl px-3 py-2">
+                            <div className="text-[10px] text-gray-400 font-medium">{label}</div>
+                            <div className={`text-[16px] font-bold ${scoreColor(Number(val))}`}>{val}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Agent KPI — chybovost, opravovost, vývoj v čase */}
+                    {ctData?.agent_kpi && ctData?.agent_trend && (() => {
+                      type AgentCfg = { key: string; label: string; color: string; bg: string; bar: string; errLabel: string }
+                      const agents: AgentCfg[] = [
+                        { key: 'accountant', label: 'ACCOUNTANT', color: 'text-blue-700', bg: 'bg-blue-50', bar: 'bg-blue-400', errLabel: 'chyb ACC' },
+                        { key: 'auditor', label: 'AUDITOR', color: 'text-purple-700', bg: 'bg-purple-50', bar: 'bg-purple-400', errLabel: 'propuštěno' },
+                        { key: 'pm', label: 'PM', color: 'text-green-700', bg: 'bg-green-50', bar: 'bg-green-400', errLabel: 'chyb PM' },
+                        { key: 'architect', label: 'ARCHITECT', color: 'text-amber-700', bg: 'bg-amber-50', bar: 'bg-amber-400', errLabel: 'chyb ARCH' },
+                      ]
+                      return (
+                        <div>
+                          <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-3">Výkonnost agentů</div>
+                          <div className="space-y-3">
+                            {agents.map(ag => {
+                              const kpi = ctData.agent_kpi?.[ag.key]
+                              const trend = ctData.agent_trend?.[ag.key] ?? []
+                              if (!kpi && trend.length === 0) return null
+                              const last = trend[trend.length - 1]
+                              const prev = trend[trend.length - 2]
+                              const confDelta = prev && prev.avg_confidence > 0 ? last?.avg_confidence - prev.avg_confidence : 0
+                              const maxConf = Math.max(...trend.map(w => w.avg_confidence), 1)
+                              const errRate = kpi?.error_rate_pct ?? 0
+                              const fixRate = ag.key === 'accountant' ? (kpi?.fix_rate_pct ?? 100) : null
+                              const totalErr = ag.key === 'auditor' ? (kpi?.auditor_false_neg ?? 0) : (kpi?.acc_errors ?? 0)
+                              return (
+                                <div key={ag.key} className={`rounded-xl px-4 py-3 ${ag.bg}`}>
+                                  {/* Header řádek */}
+                                  <div className="flex items-center justify-between mb-2">
+                                    <span className={`text-[11px] font-bold uppercase tracking-wide ${ag.color}`}>{ag.label}</span>
+                                    <div className="flex items-center gap-3">
+                                      {/* Chybovost */}
+                                      <div className="text-right">
+                                        <div className={`text-[15px] font-bold leading-none ${errRate > 10 ? 'text-red-600' : errRate > 5 ? 'text-amber-600' : 'text-green-600'}`}>
+                                          {errRate}%
+                                        </div>
+                                        <div className="text-[9px] text-gray-400">chybovost</div>
+                                      </div>
+                                      {/* Fix rate — jen pro ACC */}
+                                      {fixRate !== null && (
+                                        <div className="text-right">
+                                          <div className={`text-[15px] font-bold leading-none ${fixRate >= 80 ? 'text-green-600' : fixRate >= 50 ? 'text-amber-600' : 'text-red-600'}`}>
+                                            {fixRate}%
+                                          </div>
+                                          <div className="text-[9px] text-gray-400">opravovost</div>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  {/* Souhrnný řádek */}
+                                  <div className="flex items-center gap-3 mb-2 text-[11px] text-gray-500">
+                                    <span>{kpi?.total_decisions ?? 0} rozhodnutí</span>
+                                    {totalErr > 0 && (
+                                      <span className="text-red-500 font-medium">{totalErr}× {ag.errLabel}</span>
+                                    )}
+                                    {ag.key === 'accountant' && (kpi?.fixed ?? 0) > 0 && (
+                                      <span className="text-green-600 font-medium">{kpi?.fixed}× opraveno</span>
+                                    )}
+                                    {last?.avg_confidence > 0 && (
+                                      <span className={`ml-auto font-medium ${scoreColor(last.avg_confidence)}`}>
+                                        conf {last.avg_confidence}%
+                                        {confDelta !== 0 && <span className={confDelta > 0 ? 'text-green-500' : 'text-red-500'}> {confDelta > 0 ? '↑' : '↓'}{Math.abs(confDelta)}</span>}
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  {/* Sparkline — confidence (modrá) + chybovost (červená) po týdnech */}
+                                  {trend.length > 0 && (
+                                    <div className="flex items-end gap-0.5 h-10">
+                                      {trend.map((w, wi) => {
+                                        const errors = ag.key === 'auditor' ? w.auditor_false_neg : w.acc_errors
+                                        const errH = w.decisions > 0 ? Math.round((errors / w.decisions) * 28) : 0
+                                        const confH = w.avg_confidence > 0 ? Math.round((w.avg_confidence / maxConf) * 28) : 2
+                                        return (
+                                          <div key={wi} className="flex-1 flex flex-col items-stretch justify-end h-full gap-0.5"
+                                            title={`${w.week}: conf ${w.avg_confidence}% · ${w.decisions} rozh. · ${errors}× chyba · ${w.fixed}× opraveno`}>
+                                            {/* Error bar (červená, nahoře) */}
+                                            {errH > 0 && (
+                                              <div className="w-full bg-red-400 rounded-t opacity-90" style={{ height: `${errH}px` }} />
+                                            )}
+                                            {/* Confidence bar (barevná, dole) */}
+                                            <div className={`w-full ${ag.bar} rounded-b opacity-70`} style={{ height: `${confH}px` }} />
+                                          </div>
+                                        )
+                                      })}
+                                    </div>
+                                  )}
+                                  <div className="flex items-center justify-between mt-1">
+                                    <div className="text-[8px] text-gray-400">{trend[0]?.week}</div>
+                                    <div className="flex items-center gap-2 text-[8px] text-gray-400">
+                                      <span className="flex items-center gap-1"><span className="inline-block w-2 h-2 rounded bg-red-400" />chyba</span>
+                                      <span className={`flex items-center gap-1`}><span className={`inline-block w-2 h-2 rounded ${ag.bar}`} />conf</span>
+                                    </div>
+                                    <div className="text-[8px] text-gray-400">{last?.week}</div>
+                                  </div>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      )
+                    })()}
+
+                    {/* KPI by agent */}
+                    {kpi_by_agent?.length > 0 && (
+                      <div>
+                        <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">KPI by Agent</div>
+                        <div className="space-y-2">
+                          {kpi_by_agent.map((a, i) => (
+                            <div key={i} className="flex items-start gap-3 bg-gray-50 rounded-xl px-4 py-3">
+                              <div className="flex-1">
+                                <div className="flex items-center gap-2 mb-1">
+                                  <span className="text-[12px] font-semibold text-gray-800 uppercase">{a.agent_name}</span>
+                                  <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${riskColor(a.risk_level)}`}>{a.risk_level}</span>
+                                </div>
+                                <div className="text-[11px] text-gray-500">{a.performance_summary}</div>
+                                <div className="flex gap-3 mt-1">
+                                  <span className="text-[10px] text-green-600">+ {a.strongest_area}</span>
+                                  <span className="text-[10px] text-red-500">− {a.weakest_area}</span>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Critical issues */}
+                    {critical_issues?.length > 0 && (
+                      <div>
+                        <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Critical Issues</div>
+                        <div className="space-y-2">
+                          {critical_issues.map((issue, i) => (
+                            <div key={i} className={`rounded-xl border px-4 py-3 ${sevColor(issue.severity)}`}>
+                              <div className="flex items-center gap-2 mb-1">
+                                <span className="text-[9px] font-bold uppercase">{issue.severity}</span>
+                                <span className="text-[9px] text-gray-400">{issue.type} · {issue.owner_agent}</span>
+                              </div>
+                              <div className="text-[12px] font-semibold mb-0.5">{issue.title}</div>
+                              <div className="text-[11px] opacity-80 mb-1">{issue.symptom}</div>
+                              <div className="text-[11px] font-medium">Fix: {issue.recommended_fix}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Patterns */}
+                    {patterns?.length > 0 && (
+                      <div>
+                        <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Patterns</div>
+                        <div className="space-y-1.5">
+                          {patterns.map((p, i) => (
+                            <div key={i} className="flex items-center gap-2 text-[12px] text-gray-600">
+                              <span className={p.trend === 'worsening' ? 'text-red-400' : p.trend === 'improving' ? 'text-green-500' : 'text-gray-400'}>
+                                {p.trend === 'worsening' ? '↓' : p.trend === 'improving' ? '↑' : '→'}
+                              </span>
+                              {p.description}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Quick wins */}
+                    {quick_wins?.length > 0 && (
+                      <div>
+                        <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Quick Wins</div>
+                        <div className="space-y-1.5">
+                          {quick_wins.map((w, i) => (
+                            <div key={i} className="flex items-start gap-2 text-[12px] text-gray-700 bg-green-50 rounded-lg px-3 py-2">
+                              <span className="text-green-500 shrink-0">✓</span>
+                              <span className="flex-1">{w.action}</span>
+                              <span className="text-[10px] text-gray-400 shrink-0">{w.effort}/{w.impact}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ABRA sync status — rychlý přehled SB vs ABRA */}
+                    <div>
+                      <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">ABRA sync (SB = zdroj pravdy)</div>
+                      {abraResult ? (() => {
+                        const allOk = abraResult.diff?.length === 0 && abraResult.onlySB?.length === 0 && abraResult.onlyABRA?.length === 0
+                        const criticalCount = (abraResult.onlySB?.length ?? 0) + (abraResult.onlyABRA?.length ?? 0)
+                        const warnCount = abraResult.diff?.length ?? 0
+                        return (
+                          <div className={`rounded-xl border px-4 py-3 ${allOk ? 'bg-green-50 border-green-200' : criticalCount > 0 ? 'bg-red-50 border-red-200' : 'bg-amber-50 border-amber-200'}`}>
+                            <div className="flex items-center justify-between mb-2">
+                              <span className={`text-[13px] font-bold ${allOk ? 'text-green-700' : criticalCount > 0 ? 'text-red-700' : 'text-amber-700'}`}>
+                                {allOk ? '✓ Sync OK — SB a ABRA sedí' : criticalCount > 0 ? `✗ Kritické rozdíly (${criticalCount})` : `⚠ Rozdílný stav (${warnCount})`}
+                              </span>
+                              <button onClick={() => setCtTab('abra')} className="text-[11px] px-2.5 py-1 rounded-lg bg-white border border-gray-200 text-gray-600 hover:bg-gray-50">
+                                Otevřít ABRA sync →
+                              </button>
+                            </div>
+                            <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-gray-600">
+                              <span>SB faktury: <b>{abraResult.stats.sbTotal}</b></span>
+                              <span>ABRA FP: <b>{abraResult.stats.abraTotal}</b></span>
+                              {abraResult.stats.sbTotal !== abraResult.stats.abraTotal && (
+                                <span className="text-red-600 font-medium">diff {abraResult.stats.abraTotal - abraResult.stats.sbTotal > 0 ? '+' : ''}{abraResult.stats.abraTotal - abraResult.stats.sbTotal}</span>
+                              )}
+                              {abraResult.stats.abraBankaTotal !== undefined && (
+                                <span>ABRA banka: <b>{abraResult.stats.abraBankaTotal}</b></span>
+                              )}
+                            </div>
+                            {!allOk && (
+                              <div className="mt-2 space-y-0.5">
+                                {abraResult.onlySB?.length > 0 && <div className="text-[11px] text-red-700 font-medium">→ {abraResult.onlySB.length}× v SB, chybí v ABRA (zákonné riziko)</div>}
+                                {abraResult.onlyABRA?.length > 0 && <div className="text-[11px] text-red-700 font-medium">→ {abraResult.onlyABRA.length}× v ABRA bez SB záznamu (fantomový)</div>}
+                                {abraResult.diff?.length > 0 && <div className="text-[11px] text-amber-700">→ {abraResult.diff.length}× rozdílný stav (SB zaplaceno, ABRA jinak)</div>}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })() : (
+                        <button onClick={() => { setCtTab('abra'); loadAbraReconcile() }}
+                          className="w-full text-[12px] px-4 py-3 rounded-xl border border-dashed border-gray-200 text-gray-400 hover:bg-gray-50 hover:text-gray-600">
+                          Načíst ABRA sync →
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Chyby agentů — korekce z agent_log */}
+                    {ctData?.agent_errors && ctData.agent_errors.length > 0 && (
+                      <div>
+                        <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">
+                          Chyby agentů ({ctData.agent_errors.length})
+                        </div>
+                        <div className="space-y-2">
+                          {ctData.agent_errors.map((e, i) => (
+                            <div key={i} className="rounded-xl border border-red-200 bg-red-50 px-4 py-3">
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="flex-1">
+                                  <div className="flex items-center gap-2 mb-1">
+                                    <span className="text-[10px] font-bold uppercase text-red-700 bg-red-100 px-1.5 py-0.5 rounded">{e.typ}</span>
+                                    <span className="text-[10px] text-gray-500 uppercase">{e.rezim}</span>
+                                    {e.feedback_type && <span className="text-[9px] text-gray-400">{e.feedback_type}</span>}
+                                    {e.faktura_id && <span className="text-[9px] text-blue-500">FKT #{e.faktura_id}</span>}
+                                  </div>
+                                  <div className="text-[12px] text-red-800 font-medium mb-1">{e.popis}</div>
+                                  {e.korekce_popis && (
+                                    <div className="text-[11px] text-gray-600 italic mb-2">Doporučená korekce: {e.korekce_popis}</div>
+                                  )}
+                                </div>
+                                <div className="text-[10px] text-gray-400 shrink-0">
+                                  {new Date(e.created_at).toLocaleDateString('cs-CZ')}
+                                </div>
+                              </div>
+                              {e.feedback_type && e.feedback_type !== 'architecture_finding' && (
+                                <button
+                                  onClick={async () => {
+                                    await fetch('/api/agent/learn', {
+                                      method: 'POST',
+                                      headers: { 'Content-Type': 'application/json' },
+                                      body: JSON.stringify({
+                                        feedback_type: e.feedback_type,
+                                        poznamka: e.korekce_popis ?? e.popis,
+                                        zdroj: 'agent',
+                                        confidence: 75,
+                                      }),
+                                    })
+                                    alert('Korekce odeslána do učícího systému.')
+                                  }}
+                                  className="mt-2 text-[11px] px-3 py-1 rounded-lg bg-white border border-red-300 text-red-700 hover:bg-red-100 font-medium"
+                                >
+                                  Potvrdit → učení
+                                </button>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Strategic improvements */}
+                    {strategic_improvements?.length > 0 && (
+                      <div>
+                        <div className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Strategic Improvements</div>
+                        <div className="space-y-2">
+                          {strategic_improvements.map((s, i) => (
+                            <div key={i} className="bg-blue-50 rounded-xl px-4 py-3">
+                              <div className="flex items-center gap-2 mb-1">
+                                <span className="text-[12px] font-semibold text-blue-800">{s.title}</span>
+                                <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${s.priority === 'high' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-500'}`}>{s.priority}</span>
+                              </div>
+                              <div className="text-[11px] text-blue-600">{s.description}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
+
+              {/* ── ORCHESTRÁTOR TAB — Strategic Orchestrator ── */}
+              {!ctLoading && ctTab === 'tasking' && (() => {
+                const urgencyColor = (u: string) => u === 'critical' ? 'text-red-600 bg-red-50 border-red-200' : u === 'high' ? 'text-orange-600 bg-orange-50 border-orange-200' : u === 'medium' ? 'text-amber-600 bg-amber-50 border-amber-200' : 'text-green-600 bg-green-50 border-green-200'
+                const urgencyDot = (u: string) => u === 'critical' ? 'bg-red-500' : u === 'high' ? 'bg-orange-500' : u === 'medium' ? 'bg-amber-400' : 'bg-green-500'
+                const d = stratOrchData
+                return (
+                  <div className="px-5 py-5 space-y-4">
+                    {/* Spustit panel */}
+                    <div className="bg-gray-900 rounded-2xl px-5 py-4 flex items-center justify-between gap-4">
+                      <div>
+                        <div className="text-[13px] font-semibold text-white">Strategic Orchestrator</div>
+                        <div className="text-[11px] text-gray-400 mt-0.5">Vyhodnotí stav systému, sestaví plán a spustí agenty</div>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          onClick={() => runStrategicOrchestrator(true)}
+                          disabled={stratOrchRunning}
+                          className="text-[11px] px-3 py-1.5 rounded-lg border border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-40"
+                        >
+                          {stratOrchRunning ? '…' : 'Dry run'}
+                        </button>
+                        <button
+                          onClick={() => runStrategicOrchestrator(false)}
+                          disabled={stratOrchRunning}
+                          className="text-[11px] px-4 py-1.5 rounded-lg bg-[#0071e3] hover:bg-[#0077ed] text-white font-medium disabled:opacity-40"
+                        >
+                          {stratOrchRunning ? 'Běží…' : 'Spustit'}
+                        </button>
+                      </div>
+                    </div>
+
+                    {stratOrchRunning && (
+                      <div className="text-center py-8 text-[13px] text-gray-400 animate-pulse">Analyzuji systém a spouštím agenty…</div>
+                    )}
+
+                    {d && !stratOrchRunning && (
+                      <>
+                        {/* System health */}
+                        <div className="flex items-center gap-3">
+                          <div className={`text-[28px] font-bold leading-none ${d.system_health_pct >= 80 ? 'text-green-600' : d.system_health_pct >= 50 ? 'text-amber-600' : 'text-red-600'}`}>
+                            {d.system_health_pct}%
+                          </div>
+                          <div>
+                            <div className="text-[12px] font-medium text-gray-700">Zdraví systému</div>
+                            <div className="text-[11px] text-gray-400">{d.summary}</div>
+                          </div>
+                          {d.dry_run && <span className="ml-auto text-[10px] px-2 py-0.5 rounded-full bg-gray-100 text-gray-500 font-medium">DRY RUN</span>}
+                        </div>
+
+                        {/* Strategic insight */}
+                        {d.strategic_insight && (
+                          <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-[12px] text-amber-800">
+                            {d.strategic_insight}
+                          </div>
+                        )}
+
+                        {/* Cíle */}
+                        <div>
+                          <div className="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-2">Cíle systému</div>
+                          <div className="space-y-1.5">
+                            {d.goals.map(g => (
+                              <div key={g.id} className={`flex items-center gap-3 rounded-xl px-3 py-2 border ${g.ok ? 'bg-green-50 border-green-200' : urgencyColor(g.urgency)}`}>
+                                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${g.ok ? 'bg-green-500' : urgencyDot(g.urgency)}`} />
+                                <span className={`flex-1 text-[11px] font-medium ${g.ok ? 'text-green-700' : ''}`}>{g.label}</span>
+                                <span className="text-[10px] text-gray-500">{String(g.current)} → {g.target}</span>
+                                {!g.ok && <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded ${urgencyColor(g.urgency)}`}>{g.urgency}</span>}
+                                {g.ok && <span className="text-green-500 text-[12px]">✓</span>}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Plán */}
+                        {d.plan.length > 0 && (
+                          <div>
+                            <div className="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-2">Plán ({d.plan.length} kroků)</div>
+                            <div className="space-y-1.5">
+                              {d.plan.map(step => {
+                                const exec = d.execution.find(e => e.step === step.order)
+                                return (
+                                  <div key={step.order} className="flex items-start gap-3 bg-gray-50 rounded-xl px-3 py-2.5">
+                                    <span className="text-[10px] font-bold text-gray-400 w-4 shrink-0 mt-0.5">{step.order}.</span>
+                                    <div className="flex-1 min-w-0">
+                                      <div className="text-[11px] font-medium text-gray-800">{step.task}</div>
+                                      <div className="text-[10px] text-gray-400 mt-0.5">{step.why}</div>
+                                    </div>
+                                    <div className="shrink-0 text-right">
+                                      <span className="text-[9px] uppercase font-bold text-gray-400">{step.owner}</span>
+                                      {exec && (
+                                        <div className={`text-[10px] mt-0.5 ${exec.ok ? 'text-green-600' : 'text-red-500'}`}>
+                                          {exec.ok ? '✓' : '✗'} {exec.result}
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )}
+
+                        {d.plan.length === 0 && (
+                          <div className="text-center py-6 text-[12px] text-green-600 bg-green-50 rounded-xl">
+                            Všechny cíle splněny — systém funguje autonomně.
+                          </div>
+                        )}
+                      </>
+                    )}
+
+                    {!d && !stratOrchRunning && (
+                      <div className="text-center py-10 text-[12px] text-gray-400">
+                        Spusť orchestrátor pro analýzu systému a automatické provedení plánovaných kroků.
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
+
+              {/* ── ABRA SYNC TAB ── */}
+              {!ctLoading && ctTab === 'abra' && (
+                <div className="px-5 py-5 space-y-5">
+
+                  {/* Header + obnovit */}
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-[13px] font-semibold text-gray-800">ABRA sync</div>
+                      <div className="text-[11px] text-gray-400 mt-0.5">Supabase = zdroj pravdy · ABRA = zákonný výstup · tolerance 0</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {abraFixResult && (
+                        <span className={`text-[11px] px-2 py-0.5 rounded-lg ${abraFixResult.includes('Chyby') ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
+                          {abraFixResult}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  {abraLoading && <div className="text-center py-10 text-[13px] text-gray-400 animate-pulse">Načítám z ABRA…</div>}
+
+                  {!abraLoading && abraResult && (() => {
+                    const allOk = abraResult.diff?.length === 0 && abraResult.onlySB?.length === 0 && abraResult.onlyABRA?.length === 0 &&
+                      (!abraResult.banka || (abraResult.banka.sbBezBanky.length === 0 && abraResult.banka.abraBankaBezSB.length === 0))
+                    return (
+                      <div className="space-y-4">
+
+                        {/* Stav přehled */}
+                        <div className={`rounded-2xl px-4 py-3 text-[12px] flex flex-wrap gap-x-5 gap-y-1 ${allOk ? 'bg-green-50' : 'bg-red-50'}`}>
+                          <span className={`font-bold ${allOk ? 'text-green-700' : 'text-red-700'}`}>
+                            {allOk ? '✓ SB a ABRA jsou synchronizovány' : '✗ Nalezeny rozdíly — ABRA není synchronizována'}
+                          </span>
+                          <span className="text-gray-500">SB: <b>{abraResult.stats.sbTotal}</b> faktur</span>
+                          <span className="text-gray-500">ABRA FP: <b>{abraResult.stats.abraTotal}</b></span>
+                          <span className="text-gray-500">Spárováno: <b>{abraResult.stats.matched}</b></span>
+                          {abraResult.stats.abraBankaTotal !== undefined && <span className="text-gray-500">Banka ABRA: <b>{abraResult.stats.abraBankaTotal}</b></span>}
+                        </div>
+
+                        {/* V SB, chybí v ABRA — KRITICKÉ */}
+                        {abraResult.onlySB?.length > 0 && (
+                          <div className="rounded-xl border border-red-300 bg-red-50 px-4 py-3">
+                            <div className="flex items-center justify-between mb-2">
+                              <div>
+                                <div className="text-[11px] font-bold text-red-700 uppercase tracking-wider">Chybí v ABRA — zákonné riziko ({abraResult.onlySB.length})</div>
+                                <div className="text-[10px] text-red-500 mt-0.5">Záznamy existují v SB, ale nejsou v ABRA → daňový a zákonný problém</div>
+                              </div>
+                              <button onClick={() => abraFix('create-in-abra-bulk')} disabled={abraFixing !== null}
+                                className="text-[11px] px-3 py-1.5 rounded-lg bg-red-600 text-white font-medium hover:bg-red-700 disabled:opacity-40 whitespace-nowrap">
+                                {abraFixing === 'create-in-abra-bulk' ? 'Vytvářím…' : `Synchronizovat vše (${abraResult.onlySB.length})`}
+                              </button>
+                            </div>
+                            <div className="space-y-1">
+                              {abraResult.onlySB.map(f => (
+                                <div key={f.id} className="flex items-center justify-between bg-white/60 rounded-lg px-3 py-1.5">
+                                  <div>
+                                    <span className="text-[12px] font-medium text-gray-900">{f.dodavatel}</span>
+                                    <span className="text-[11px] text-gray-400 ml-2">{f.cislo_faktury}</span>
+                                  </div>
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-[12px] font-medium text-gray-700">{fmt(f.castka_s_dph, f.mena)}</span>
+                                    <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${f.stav === 'zaplacena' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>{f.stav}</span>
+                                    <button onClick={() => abraFix('create-in-abra', { sbId: f.id })} disabled={abraFixing !== null}
+                                      className="text-[10px] px-2 py-0.5 rounded bg-red-100 text-red-700 hover:bg-red-200 disabled:opacity-40">Sync</button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Jen v ABRA — fantomové záznamy */}
+                        {abraResult.onlyABRA?.length > 0 && (
+                          <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3">
+                            <div className="text-[11px] font-bold text-red-700 uppercase tracking-wider mb-1">Fantomové záznamy v ABRA ({abraResult.onlyABRA.length})</div>
+                            <div className="text-[10px] text-red-500 mb-2">V ABRA existují FP záznamy bez odpovídajícího záznamu v SB → přebytek v účetnictví</div>
+                            <div className="space-y-1">
+                              {abraResult.onlyABRA.map(f => (
+                                <div key={f.id} className="flex items-center justify-between bg-white/60 rounded-lg px-3 py-1.5">
+                                  <div>
+                                    <span className="text-[12px] text-gray-700">{f.firma}</span>
+                                    <span className="text-[11px] text-gray-400 ml-2">{f.kod}</span>
+                                  </div>
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-[12px] font-medium text-gray-600">{fmt(f.sumCelkem, 'CZK')}</span>
+                                    <button onClick={() => abraFix('delete-abra', { abraId: f.id })} disabled={abraFixing !== null}
+                                      className="text-[10px] px-2 py-0.5 rounded bg-red-100 text-red-700 hover:bg-red-200 disabled:opacity-40">Smazat</button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Rozdílný stav */}
+                        {abraResult.diff?.length > 0 && (
+                          <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
+                            <div className="flex items-center justify-between mb-2">
+                              <div>
+                                <div className="text-[11px] font-bold text-amber-700 uppercase tracking-wider">Rozdílný stav SB vs ABRA ({abraResult.diff.length})</div>
+                                <div className="text-[10px] text-amber-600 mt-0.5">
+                                  {abraResult.stats.diffWithTransakce ?? 0} s transakcí · {abraResult.stats.diffWithoutTransakce ?? 0} bez transakce
+                                </div>
+                              </div>
+                              <div className="flex gap-2">
+                                {(abraResult.stats.diffWithTransakce ?? 0) > 0 && (
+                                  <button onClick={() => abraFix('create-banka-bulk')} disabled={abraFixing !== null}
+                                    className="text-[11px] px-3 py-1 rounded-lg bg-green-600 text-white font-medium hover:bg-green-700 disabled:opacity-40">
+                                    {abraFixing === 'create-banka-bulk' ? 'Zaúčtovávám…' : `Zaúčtovat (${abraResult.stats.diffWithTransakce})`}
+                                  </button>
+                                )}
+                                {(abraResult.stats.diffWithoutTransakce ?? 0) > 0 && (
+                                  <button onClick={() => abraFix('fix-stav-bulk')} disabled={abraFixing !== null}
+                                    className="text-[11px] px-3 py-1 rounded-lg bg-amber-600 text-white font-medium hover:bg-amber-700 disabled:opacity-40">
+                                    {abraFixing === 'fix-stav-bulk' ? 'Opravuji…' : `Ručně (${abraResult.stats.diffWithoutTransakce})`}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                            <div className="space-y-1">
+                              {abraResult.diff.map(d => {
+                                const hasTrans = 'transakce' in d && d.transakce != null
+                                return (
+                                  <div key={d.sb.id} className="flex items-center justify-between bg-white/60 rounded-lg px-3 py-1.5">
+                                    <div>
+                                      <span className="text-[12px] font-medium text-gray-900">{d.sb.dodavatel}</span>
+                                      <span className="text-[10px] text-gray-400 ml-2">{d.sb.cislo_faktury} · {d.abra.kod}</span>
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-[11px] px-1.5 py-0.5 rounded-full bg-green-100 text-green-700">SB: {d.sb.stav}</span>
+                                      <span className="text-[11px] px-1.5 py-0.5 rounded-full bg-red-100 text-red-700">ABRA: {d.abraStav}</span>
+                                      {hasTrans
+                                        ? <button onClick={() => abraFix('create-banka', { sbId: d.sb.id, abraId: d.abra.id, transakceId: (d as {transakce: {id: number}}).transakce.id })} disabled={abraFixing !== null}
+                                            className="text-[10px] px-2 py-0.5 rounded bg-green-100 text-green-700 hover:bg-green-200 disabled:opacity-40">Zaúčtovat</button>
+                                        : <button onClick={() => abraFix('fix-stav', { abraId: d.abra.id })} disabled={abraFixing !== null}
+                                            className="text-[10px] px-2 py-0.5 rounded bg-amber-100 text-amber-700 hover:bg-amber-200 disabled:opacity-40">Ručně</button>
+                                      }
+                                    </div>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Banka diff */}
+                        {abraResult.banka && (abraResult.banka.sbBezBanky.length > 0 || abraResult.banka.abraBankaBezSB.length > 0) && (
+                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3">
+                            <div className="text-[11px] font-bold text-gray-600 uppercase tracking-wider mb-2">
+                              Banka doklady · SB spárované: {abraResult.stats.sbSparovaneTotal} · ABRA: {abraResult.stats.abraBankaTotal}
+                            </div>
+                            {abraResult.banka.sbBezBanky.length > 0 && (
+                              <div className="mb-3">
+                                <div className="text-[10px] font-semibold text-amber-700 uppercase mb-1">Spárováno v SB, chybí banka doklad v ABRA ({abraResult.banka.sbBezBanky.length})</div>
+                                {abraResult.banka.sbBezBanky.map(b => (
+                                  <div key={b.sbId} className="flex items-center justify-between bg-white/70 rounded-lg px-3 py-1.5 mb-1">
+                                    <span className="text-[12px] text-gray-800">{b.dodavatel}</span>
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-[11px] text-gray-600">{fmt(b.castka, b.mena)}</span>
+                                      <button onClick={() => abraFix('create-banka', { sbId: b.sbId, abraId: abraResult!.diff.find(d => d.sb.id === b.sbId)?.abra.id ?? '', transakceId: 0 })} disabled={abraFixing !== null}
+                                        className="text-[10px] px-2 py-0.5 rounded bg-amber-100 text-amber-700 hover:bg-amber-200 disabled:opacity-40">Sync</button>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            {abraResult.banka.abraBankaBezSB.length > 0 && (
+                              <div>
+                                <div className="text-[10px] font-semibold text-gray-500 uppercase mb-1">V ABRA bez SB transakce ({abraResult.banka.abraBankaBezSB.length})</div>
+                                {abraResult.banka.abraBankaBezSB.map(b => (
+                                  <div key={b.id} className="flex items-center justify-between bg-white/70 rounded-lg px-3 py-1.5 mb-1">
+                                    <span className="text-[12px] text-gray-600">{b.popis}</span>
+                                    <span className="text-[11px] text-gray-500">{fmt(b.sumOsv, 'CZK')} · {fmtDate(b.datVyst)}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Audit Model B */}
+                        <div className="border-t border-gray-100 pt-4">
+                          <div className="flex items-center gap-3 mb-3">
+                            <button onClick={loadAuditFull} disabled={auditFullLoading}
+                              className="text-[11px] px-3 py-1.5 rounded-lg bg-[#0071e3] text-white font-medium hover:bg-[#0077ed] disabled:opacity-50">
+                              {auditFullLoading ? 'Audituji…' : 'Spustit hloubkový audit'}
+                            </button>
+                            {auditFullResult && (
+                              <span className={`text-[11px] px-2 py-0.5 rounded-lg font-medium ${!(auditFullResult.data.shoda.faktury_ok && auditFullResult.data.shoda.banka_ok) ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
+                                {!(auditFullResult.data.shoda.faktury_ok && auditFullResult.data.shoda.banka_ok)
+                                  ? `rozdíl banka ${auditFullResult.data.shoda.banka_diff}, faktury ${auditFullResult.data.shoda.faktury_diff}`
+                                  : '✓ Hloubkový audit OK'}
+                              </span>
+                            )}
+                          </div>
+                          {auditFullResult && !auditFullResult.data.shoda.faktury_ok || auditFullResult && !auditFullResult.data.shoda.banka_ok ? (
+                            <div className="space-y-2">
+                              {auditFullResult!.data.rozdily.chybejici_v_abra.length > 0 && (
+                                <div className="rounded-lg bg-red-50 border border-red-200 px-3 py-2">
+                                  <div className="text-[10px] font-bold text-red-700 uppercase mb-1">Chybí v ABRA ({auditFullResult!.data.rozdily.chybejici_v_abra.length})</div>
+                                  {auditFullResult!.data.rozdily.chybejici_v_abra.map(f => (
+                                    <div key={f.id} className="text-[11px] text-red-800">{f.dodavatel} · {f.castka.toLocaleString('cs-CZ')} Kč · {f.ocekavany_kod}</div>
+                                  ))}
+                                  <button onClick={() => abraFix('create-in-abra-bulk')} disabled={abraFixing !== null}
+                                    className="mt-2 text-[10px] px-2.5 py-1 rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-40">
+                                    Synchronizovat do ABRA
+                                  </button>
+                                </div>
+                              )}
+                              {auditFullResult!.data.rozdily['osirelé_v_abra'].length > 0 && (
+                                <div className="rounded-lg bg-orange-50 border border-orange-200 px-3 py-2">
+                                  <div className="text-[10px] font-bold text-orange-700 uppercase mb-1">Osiřelé v ABRA ({auditFullResult!.data.rozdily['osirelé_v_abra'].length})</div>
+                                  {auditFullResult!.data.rozdily['osirelé_v_abra'].map(kod => (
+                                    <div key={kod} className="text-[11px] text-orange-800">{kod}</div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ) : auditFullResult ? (
+                            <div className="text-[12px] text-green-600">✓ Hloubkový audit: SB a ABRA jsou synchronizovány</div>
+                          ) : null}
+                        </div>
+
+                        {allOk && (
+                          <div className="text-center py-6 text-[13px] text-green-600 font-medium">✓ Supabase a ABRA jsou plně synchronizovány</div>
+                        )}
+                      </div>
+                    )
+                  })()}
+
+                  {!abraLoading && !abraResult && (
+                    <div className="text-center py-10">
+                      <button onClick={loadAbraReconcile} className="text-[13px] px-4 py-2 rounded-xl bg-[#0071e3] text-white hover:bg-[#0077ed]">
+                        Načíst ABRA sync
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* ── PM AGENT TAB ── */}
+              {!ctLoading && ctTab === 'agent' && (
+                <div className="flex flex-col h-full">
+                  <div className="flex-1 overflow-y-auto px-5 py-4 space-y-2">
+                    {agentLog.length === 0 && !agentRunning && (
+                      <div className="text-[13px] text-gray-400 text-center py-8">Agent ještě nebyl spuštěn.</div>
+                    )}
+                    {agentLog.length === 0 && agentRunning && (
+                      <div className="text-[13px] text-gray-400 animate-pulse">Analyzuji backlog…</div>
+                    )}
+                    {agentLog.map((entry, i) => (
+                      <div key={i} className={`flex gap-2 text-[13px] ${
+                        entry.type === 'action' ? 'text-green-700' :
+                        entry.type === 'warn' ? 'text-orange-600' : 'text-gray-500'
+                      }`}>
+                        <span className="shrink-0 mt-0.5">{entry.type === 'action' ? '✓' : entry.type === 'warn' ? '⚠' : '·'}</span>
+                        <span>{entry.text}</span>
+                      </div>
+                    ))}
+                    {agentQuestion && (
+                      <div className="mt-4 bg-blue-50 border border-blue-200 rounded-xl p-4">
+                        <div className="text-[11px] font-semibold text-blue-500 uppercase tracking-wider mb-1">Potřebuji vaši odpověď</div>
+                        <div className="text-[13px] font-medium text-gray-800 mb-1">{agentQuestion.otazka}</div>
+                        <div className="text-[12px] text-gray-500 mb-3">{agentQuestion.kontext}</div>
+                        {agentQuestion.moznosti.length > 0 ? (
+                          <div className="flex flex-wrap gap-2 mb-3">
+                            {agentQuestion.moznosti.map((m, i) => (
+                              <button key={i} onClick={() => setAgentAnswer(m)}
+                                className={`px-3 py-1 rounded-lg text-[12px] font-medium border transition-colors ${agentAnswer === m ? 'bg-blue-600 text-white border-blue-600' : 'border-gray-200 text-gray-700 hover:bg-gray-50'}`}>
+                                {m}
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          <textarea value={agentAnswer} onChange={e => setAgentAnswer(e.target.value)}
+                            placeholder="Vaše odpověď…" rows={2}
+                            className="w-full text-[13px] border border-gray-200 rounded-lg px-3 py-2 mb-3 focus:outline-none focus:border-blue-300 resize-none" />
+                        )}
+                        <button onClick={() => { if (!agentAnswer.trim()) return; const ans = agentAnswer; setAgentAnswer(''); runAgent(agentQuestion!.messages, agentQuestion!.tool_use_id, ans) }}
+                          disabled={!agentAnswer.trim() || agentRunning}
+                          className="w-full py-2 bg-blue-600 text-white rounded-lg text-[13px] font-medium hover:bg-blue-700 disabled:opacity-50">
+                          Odpovědět
+                        </button>
+                      </div>
+                    )}
+                    {agentSummary && (
+                      <div className="mt-4 bg-green-50 border border-green-200 rounded-xl p-4">
+                        <div className="text-[11px] font-semibold text-green-600 uppercase tracking-wider mb-1">Hotovo</div>
+                        <div className="text-[13px] text-gray-700">{agentSummary}</div>
+                      </div>
+                    )}
+                    {agentRunning && agentLog.length > 0 && (
+                      <div className="text-[12px] text-gray-400 animate-pulse">Zpracovávám…</div>
+                    )}
+                  </div>
+                  <div className="px-5 py-4 border-t border-gray-100 shrink-0">
+                    <button onClick={() => runAgent()} disabled={agentRunning}
+                      className="w-full py-2.5 bg-[#0071e3] text-white rounded-xl text-[13px] font-medium hover:bg-[#0077ed] disabled:opacity-50">
+                      {agentRunning ? 'Agent pracuje…' : agentSummary ? 'Spustit znovu' : 'Spustit PM Agenta'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Empty state */}
+              {!ctLoading && ctTab !== 'agent' && !ctData && (
+                <div className="flex flex-col items-center justify-center h-full gap-3 px-6">
+                  <div className="text-[13px] text-gray-400 text-center">Dashboard ještě nebyl načten.</div>
+                  <button onClick={loadControlTower} className="px-4 py-2 bg-[#0071e3] text-white rounded-xl text-[12px] font-medium">
+                    Analyzovat systém
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

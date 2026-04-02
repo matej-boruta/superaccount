@@ -56,7 +56,10 @@ function parseFioTx(data: Record<string, unknown>, ucet: string) {
   })
 }
 
-export async function POST() {
+export async function POST(req: Request) {
+  let body: { dateFrom?: string; dateTo?: string } = {}
+  try { body = await req.json() } catch { /* no body */ }
+
   const log: { ucet: string; count: number; saved: number; error?: string }[] = []
 
   for (let i = 0; i < FIO_TOKENS.length; i++) {
@@ -64,10 +67,11 @@ export async function POST() {
 
     const { token, label } = FIO_TOKENS[i]
     try {
-      const fioRes = await fetch(
-        `https://fioapi.fio.cz/v1/rest/last/${token}/transactions.json`,
-        { signal: AbortSignal.timeout(15_000) }
-      )
+      const fioUrl = body.dateFrom && body.dateTo
+        ? `https://fioapi.fio.cz/v1/rest/periods/${token}/${body.dateFrom}/${body.dateTo}/transactions.json`
+        : `https://fioapi.fio.cz/v1/rest/last/${token}/transactions.json`
+
+      const fioRes = await fetch(fioUrl, { signal: AbortSignal.timeout(15_000) })
       const data = await fioRes.json()
       const stmt = data?.accountStatement
       if (!stmt) {

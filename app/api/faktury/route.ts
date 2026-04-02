@@ -8,7 +8,7 @@ export async function GET(req: Request) {
   const rok = parseInt(searchParams.get('rok') ?? String(new Date().getFullYear()))
   const rokFilter = `&datum_vystaveni=gte.${rok}-01-01&datum_vystaveni=lte.${rok}-12-31`
 
-  const url = `${SUPABASE_URL}/rest/v1/faktury?select=id,dodavatel,ico,datum_vystaveni,datum_splatnosti,cislo_faktury,castka_bez_dph,dph,castka_s_dph,mena,popis,variabilni_symbol,stav,prijato_at,platba_naplanovana,datum_platby,kategorie_id,zauctovano_platba&stav=in.(nova,schvalena,zaplacena,zamitnuta)${rokFilter}&order=datum_splatnosti.asc`
+  const url = `${SUPABASE_URL}/rest/v1/faktury?select=id,dodavatel,ico,datum_vystaveni,datum_splatnosti,cislo_faktury,castka_bez_dph,dph,castka_s_dph,mena,popis,variabilni_symbol,stav,prijato_at,platba_naplanovana,datum_platby,kategorie_id,zauctovano_platba,stav_workflow,blocker&stav=in.(nova,schvalena,zaplacena,zamitnuta)${rokFilter}&order=datum_splatnosti.asc`
   const headers = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
 
   const res = await fetch(url, { headers })

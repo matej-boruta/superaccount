@@ -11,10 +11,11 @@ const ABRA_USER = process.env.ABRA_USER!
 const ABRA_PASS = process.env.ABRA_PASS!
 const ABRA_AUTH = 'Basic ' + Buffer.from(`${ABRA_USER}:${ABRA_PASS}`).toString('base64')
 
-export async function GET() {
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url)
   const now = new Date()
-  const currentYear = now.getFullYear()
-  const currentMonth = now.getMonth() + 1
+  const currentYear = parseInt(searchParams.get('rok') ?? String(now.getFullYear()))
+  const currentMonth = currentYear === now.getFullYear() ? now.getMonth() + 1 : 12
 
   // 1. Fetch ABRA faktura-prijata — only FP-* records (SuperAccount managed)
   const faRes = await fetch(
