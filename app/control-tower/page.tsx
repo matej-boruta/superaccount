@@ -123,71 +123,159 @@ type AbraResult = {
 
 const YEAR = new Date().getFullYear()
 
-function ScoreBar({ label, value, color }: { label: string; value: number; color: string }) {
+function ScoreBar({ label, value, reasons }: { label: string; value: number; reasons?: string[] }) {
+  const col = value >= 80 ? 'text-green-600' : value >= 60 ? 'text-amber-600' : 'text-red-500'
   return (
     <div>
       <div className="flex items-center justify-between mb-1">
         <span className="text-[11px] text-gray-500">{label}</span>
-        <span className={`text-[11px] font-semibold ${color}`}>{value}</span>
+        <span className={`text-[11px] font-semibold tabular-nums ${col}`}>{value}</span>
       </div>
-      <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
-        <div className={`h-full rounded-full transition-all ${value >= 80 ? 'bg-green-500' : value >= 60 ? 'bg-amber-400' : 'bg-red-400'}`} style={{ width: `${value}%` }} />
+      <div className="h-1 bg-gray-100 rounded-full overflow-hidden mb-1">
+        <div className={`h-full rounded-full ${value >= 80 ? 'bg-green-500' : value >= 60 ? 'bg-amber-400' : 'bg-red-400'}`} style={{ width: `${value}%` }} />
       </div>
+      {reasons && reasons.length > 0 && (
+        <ul className="space-y-0.5 mt-0.5">
+          {reasons.map((r, i) => <li key={i} className="text-[10px] text-gray-400 flex gap-1"><span className="shrink-0 text-gray-300">·</span>{r}</li>)}
+        </ul>
+      )}
     </div>
   )
 }
 
-function AgentCard({ agentKey, label, color, bg, border, kpi, trend }: {
-  agentKey: string; label: string; color: string; bg: string; border: string
+type AgentStatus = 'no_data' | 'blocked' | 'at_risk' | 'ok'
+
+const AGENT_STATUS_CFG: Record<AgentStatus, { label: string; bg: string; dot: string; text: string }> = {
+  no_data:  { label: 'NO DATA',  bg: 'bg-gray-50',   dot: 'bg-gray-300',  text: 'text-gray-400' },
+  blocked:  { label: 'BLOCKED',  bg: 'bg-orange-50', dot: 'bg-orange-400', text: 'text-orange-600' },
+  at_risk:  { label: 'AT RISK',  bg: 'bg-amber-50',  dot: 'bg-amber-400', text: 'text-amber-700' },
+  ok:       { label: 'OK',       bg: 'bg-green-50',  dot: 'bg-green-500', text: 'text-green-700' },
+}
+
+const AGENT_ROLE_KPI: Record<string, Array<{ key: string; label: string }>> = {
+  accountant: [{ key: 'classified', label: 'klasif.' }, { key: 'confidence', label: 'conf.' }, { key: 'errors', label: 'chyby' }],
+  auditor:    [{ key: 'reviewed', label: 'reviewed' }, { key: 'flagged', label: 'flagged' }, { key: 'false_neg', label: 'false neg.' }],
+  pm:         [{ key: 'coverage', label: 'pokrytí' }, { key: 'missing', label: 'chybí' }, { key: 'unmatched', label: 'nespárov.' }],
+  architect:  [{ key: 'rules', label: 'pravidla' }, { key: 'confidence', label: 'avg conf.' }, { key: 'pending', label: 'čeká schv.' }],
+}
+
+function AgentCard({ agentKey, label, kpi, trend, snapshot }: {
+  agentKey: string; label: string
   kpi?: { total_decisions: number; error_rate_pct: number; fix_rate_pct: number }
   trend?: Array<{ week: string; avg_confidence: number; decisions: number; error_rate_pct: number }>
+  snapshot?: Record<string, unknown>
 }) {
+  const hasDecisions = (kpi?.total_decisions ?? 0) > 0
+  const faktury = snapshot?.faktury as Record<string, number> | undefined
+  const hasWorkToDo = (faktury?.nova ?? 0) > 0 || (faktury?.bez_kategorie ?? 0) > 0
+
+  let status: AgentStatus = 'no_data'
+  if (hasDecisions) {
+    status = (kpi!.error_rate_pct > 10) ? 'at_risk' : 'ok'
+  } else if (hasWorkToDo && (agentKey === 'accountant' || agentKey === 'pm')) {
+    status = 'blocked'
+  }
+
+  const cfg = AGENT_STATUS_CFG[status]
   const weeks = trend?.slice(-6) ?? []
-  const maxConf = 100
+
+  // Build role-specific KPI values
+  const roleKpis: Array<{ label: string; value: string }> = []
+  const transakce = snapshot?.transakce as Record<string, number> | undefined
+  const agentLog = snapshot?.agent_log as Record<string, unknown> | undefined
+
+  if (agentKey === 'accountant') {
+    const total = faktury?.total ?? 0
+    const bezKat = faktury?.bez_kategorie ?? 0
+    const classified = total > 0 ? Math.round(((total - bezKat) / total) * 100) : 0
+    const avgConf = typeof agentLog?.avg_confidence === 'number' ? agentLog.avg_confidence : 0
+    roleKpis.push(
+      { label: 'klasif.', value: `${classified}%` },
+      { label: 'avg conf.', value: hasDecisions ? `${avgConf}%` : '—' },
+      { label: 'chybovost', value: hasDecisions ? `${kpi!.error_rate_pct}%` : '—' },
+    )
+  } else if (agentKey === 'auditor') {
+    roleKpis.push(
+      { label: 'rozhodnutí', value: hasDecisions ? String(kpi!.total_decisions) : '—' },
+      { label: 'false neg.', value: hasDecisions ? `${kpi!.error_rate_pct}%` : '—' },
+      { label: 'fix rate', value: hasDecisions ? `${kpi!.fix_rate_pct}%` : '—' },
+    )
+  } else if (agentKey === 'pm') {
+    const nespar = transakce?.nesparovane ?? 0
+    const bezKat = faktury?.bez_kategorie ?? 0
+    roleKpis.push(
+      { label: 'bez kategorie', value: String(bezKat) },
+      { label: 'nespárované', value: String(nespar) },
+      { label: 'needs_info', value: String(faktury?.needs_info ?? 0) },
+    )
+  } else if (agentKey === 'architect') {
+    const pravidla = snapshot?.pravidla as Record<string, number> | undefined
+    roleKpis.push(
+      { label: 'pravidla', value: String((pravidla?.dodavatel_pravidla ?? 0) + (pravidla?.ucetni_pravidla_total ?? 0)) },
+      { label: 'avg conf.', value: pravidla?.avg_confidence != null ? `${pravidla.avg_confidence}%` : '—' },
+      { label: 'čeká schv.', value: String(pravidla?.pending_approval ?? 0) },
+    )
+  }
+
+  const blockedReason = status === 'blocked'
+    ? agentKey === 'accountant' ? `${faktury?.bez_kategorie ?? 0} faktur čeká na klasifikaci` : `${faktury?.nova ?? 0} faktur bez zpracování`
+    : null
+  const noDataReason = status === 'no_data'
+    ? agentKey === 'auditor' ? 'Žádná rozhodnutí ke kontrole — čeká na accountanta'
+    : agentKey === 'architect' ? 'Žádná aktivita — monitoring pasivní'
+    : 'Žádný agent_log pro tuto roli'
+    : null
+
   return (
-    <div className={`rounded-2xl border ${border} ${bg} px-4 py-4`}>
+    <div className={`rounded-2xl border ${status === 'ok' ? 'border-green-100' : status === 'at_risk' ? 'border-amber-200' : status === 'blocked' ? 'border-orange-200' : 'border-gray-100'} ${cfg.bg} px-4 py-4`}>
       <div className="flex items-start justify-between mb-3">
         <div>
-          <div className={`text-[11px] font-bold uppercase tracking-wider ${color}`}>{label}</div>
-          {kpi && kpi.total_decisions > 0 ? (
-            <div className="text-[10px] text-gray-400 mt-0.5">{kpi.total_decisions} rozh.</div>
-          ) : (
-            <div className="text-[10px] text-gray-400 mt-0.5">žádná data</div>
-          )}
+          <div className="text-[11px] font-bold text-gray-700 uppercase tracking-wider">{label}</div>
+          <div className={`flex items-center gap-1 mt-1`}>
+            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot}`} />
+            <span className={`text-[10px] font-semibold ${cfg.text}`}>{cfg.label}</span>
+          </div>
         </div>
-        {kpi && kpi.total_decisions > 0 && (
-          <div className="text-right">
-            <div className={`text-[15px] font-bold leading-none ${kpi.error_rate_pct > 10 ? 'text-red-600' : kpi.error_rate_pct > 5 ? 'text-amber-600' : 'text-green-600'}`}>
-              {kpi.error_rate_pct}%
-            </div>
-            <div className="text-[9px] text-gray-400 mt-0.5">chybovost</div>
+        {hasDecisions && (
+          <div className={`text-[13px] font-bold tabular-nums ${kpi!.error_rate_pct > 10 ? 'text-red-600' : kpi!.error_rate_pct > 5 ? 'text-amber-600' : 'text-green-600'}`}>
+            {kpi!.error_rate_pct}%
+            <div className="text-[9px] text-gray-400 font-normal">chybovost</div>
           </div>
         )}
       </div>
-      {/* Sparkline */}
-      {weeks.length > 0 && (
-        <div className="flex items-end gap-0.5 h-8">
-          {weeks.map((w, i) => (
-            <div key={i} className="flex-1 flex flex-col items-center justify-end gap-0.5 h-full">
-              <div
-                className="w-full rounded-sm bg-blue-300 opacity-60"
-                style={{ height: `${Math.round((w.avg_confidence / maxConf) * 100)}%`, minHeight: 2 }}
-                title={`${w.week}: conf ${w.avg_confidence}%`}
-              />
-              {w.error_rate_pct > 0 && (
-                <div
-                  className="w-full rounded-sm bg-red-400"
-                  style={{ height: `${Math.min(w.error_rate_pct, 30)}%`, minHeight: 1 }}
-                  title={`chyb: ${w.error_rate_pct}%`}
-                />
-              )}
+
+      {/* Role-specific KPIs */}
+      {roleKpis.length > 0 && (
+        <div className="grid grid-cols-3 gap-1 mb-3">
+          {roleKpis.map((k, i) => (
+            <div key={i} className="text-center">
+              <div className="text-[12px] font-semibold text-gray-700 tabular-nums">{k.value}</div>
+              <div className="text-[9px] text-gray-400">{k.label}</div>
             </div>
           ))}
         </div>
       )}
-      {kpi && kpi.total_decisions > 0 && (
-        <div className="flex gap-3 mt-2">
-          <div className="text-[10px] text-gray-500">Fix rate: <span className="font-medium text-gray-700">{kpi.fix_rate_pct}%</span></div>
+
+      {/* Status reason */}
+      {blockedReason && (
+        <div className="text-[10px] text-orange-600 bg-orange-100/60 rounded-lg px-2 py-1 mb-2">{blockedReason}</div>
+      )}
+      {noDataReason && (
+        <div className="text-[10px] text-gray-400 mb-2">{noDataReason}</div>
+      )}
+
+      {/* Sparkline */}
+      {weeks.length > 0 && (
+        <div className="flex items-end gap-0.5 h-7">
+          {weeks.map((w, i) => (
+            <div key={i} className="flex-1 flex flex-col items-center justify-end gap-0.5 h-full">
+              <div className="w-full rounded-sm bg-blue-200" style={{ height: `${Math.round((w.avg_confidence / 100) * 100)}%`, minHeight: 2 }}
+                title={`${w.week}: conf ${w.avg_confidence}%`} />
+              {w.error_rate_pct > 0 && (
+                <div className="w-full rounded-sm bg-red-300" style={{ height: `${Math.min(w.error_rate_pct, 30)}%`, minHeight: 1 }} />
+              )}
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -295,22 +383,6 @@ export default function ControlTowerPage() {
         </div>
       </div>
 
-      {/* System Health bar */}
-      {sh && (
-        <div className={`px-6 py-3 flex items-center gap-4 border-b ${sh.overall_score >= 80 ? 'bg-green-50 border-green-100' : sh.overall_score >= 60 ? 'bg-amber-50 border-amber-100' : 'bg-red-50 border-red-100'}`}>
-          <div className={`text-[24px] font-bold leading-none ${sh.overall_score >= 80 ? 'text-green-700' : sh.overall_score >= 60 ? 'text-amber-700' : 'text-red-700'}`}>
-            {sh.overall_score}%
-          </div>
-          <div className="flex-1">
-            <div className="text-[11px] font-medium text-gray-700">{sh.summary}</div>
-          </div>
-          {abraBad && (
-            <div className="text-[11px] px-2.5 py-1 rounded-lg bg-orange-500 text-white font-medium">
-              ABRA nesynchronizována
-            </div>
-          )}
-        </div>
-      )}
 
       {/* Tabs */}
       <div className="flex border-b border-gray-100 bg-white px-6">
@@ -337,23 +409,96 @@ export default function ControlTowerPage() {
 
         {/* ── DASHBOARD ── */}
         {!loading && tab === 'dashboard' && ctData?.analysis && (() => {
-          const { system_health: sh2, kpi_by_agent, critical_issues, quick_wins } = ctData.analysis
+          const { system_health: sh2, critical_issues, quick_wins } = ctData.analysis
+          const snap = ctData.snapshot as Record<string, unknown>
+          const faktury = snap?.faktury as Record<string, number> | undefined
+          const transakce = snap?.transakce as Record<string, number> | undefined
+
+          // System status determination
+          const sysScore = sh2.overall_score
+          const sysStatus: AgentStatus = sysScore >= 80 ? 'ok' : sysScore >= 60 ? 'at_risk' : 'blocked'
+          const sysStatusCfg = AGENT_STATUS_CFG[sysStatus]
+
+          // Root cause bullets per score
+          const accReasons: string[] = []
+          if ((faktury?.bez_kategorie ?? 0) > 0) accReasons.push(`${faktury!.bez_kategorie} faktur bez kategorie`)
+          if (sh2.accounting_quality < 80) accReasons.push('nízká avg confidence')
+
+          const auditReasons: string[] = []
+          if ((ctData.agent_kpi?.auditor?.total_decisions ?? 0) === 0) auditReasons.push('žádná rozhodnutí auditora')
+          if (sh2.audit_quality < 80) auditReasons.push('nízký podíl high-confidence rozhodnutí')
+
+          const workflowReasons: string[] = []
+          if ((faktury?.needs_info ?? 0) > 0) workflowReasons.push(`${faktury!.needs_info} faktur v NEEDS_INFO`)
+          if ((faktury?.overdue ?? 0) > 0) workflowReasons.push(`${faktury!.overdue} faktur po splatnosti`)
+          if ((faktury?.s_workflow ?? 0) === 0) workflowReasons.push('žádné faktury s workflow stavem')
+
+          const dataReasons: string[] = []
+          if ((faktury?.bez_kategorie ?? 0) > 0) dataReasons.push(`${faktury!.bez_kategorie} faktur bez kategorie`)
+          if ((transakce?.nesparovane ?? 0) > 0) dataReasons.push(`${transakce!.nesparovane} nespárovaných transakcí`)
+
+          const sysReasons: string[] = [
+            ...((faktury?.bez_kategorie ?? 0) > 0 ? [`${faktury!.bez_kategorie} faktur bez kategorie`] : []),
+            ...((transakce?.nesparovane ?? 0) > 0 ? [`${transakce!.nesparovane} nespárovaných transakcí`] : []),
+            ...((faktury?.needs_info ?? 0) > 0 ? [`${faktury!.needs_info} faktur čeká na info`] : []),
+            ...(abraBad ? ['ABRA není synchronizována'] : []),
+          ]
+
           return (
-            <div className="space-y-6 max-w-5xl">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                {/* System Health detail */}
-                <div className="bg-white rounded-2xl border border-gray-100 px-5 py-5 space-y-3">
+            <div className="space-y-5 max-w-5xl">
+
+              {/* System status — top */}
+              <div className={`rounded-2xl border px-5 py-4 flex items-start gap-4 ${sysStatus === 'ok' ? 'bg-green-50 border-green-100' : sysStatus === 'at_risk' ? 'bg-amber-50 border-amber-200' : 'bg-red-50 border-red-200'}`}>
+                <div>
+                  <div className={`text-[28px] font-bold leading-none tabular-nums ${sysStatus === 'ok' ? 'text-green-700' : sysStatus === 'at_risk' ? 'text-amber-700' : 'text-red-700'}`}>{sysScore}%</div>
+                  <div className={`flex items-center gap-1 mt-1.5`}>
+                    <span className={`w-2 h-2 rounded-full ${sysStatusCfg.dot}`} />
+                    <span className={`text-[10px] font-bold uppercase tracking-wide ${sysStatusCfg.text}`}>{sysStatusCfg.label}</span>
+                  </div>
+                </div>
+                <div className="flex-1">
+                  <div className="text-[12px] text-gray-700 font-medium mb-1.5">{sh2.summary}</div>
+                  {sysReasons.length > 0 && (
+                    <ul className="space-y-0.5">
+                      {sysReasons.map((r, i) => (
+                        <li key={i} className="text-[11px] text-gray-500 flex gap-1.5"><span className="text-gray-300 shrink-0">·</span>{r}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+
+              {/* Data Coverage */}
+              <div className="bg-white rounded-2xl border border-gray-100 px-5 py-4">
+                <div className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-3">Data coverage</div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                  {[
+                    { label: 'Faktury celkem', val: faktury?.total ?? 0, bad: false },
+                    { label: 'Bez kategorie', val: faktury?.bez_kategorie ?? 0, bad: (faktury?.bez_kategorie ?? 0) > 0 },
+                    { label: 'Nespárované TX', val: transakce?.nesparovane ?? 0, bad: (transakce?.nesparovane ?? 0) > 0 },
+                    { label: 'NEEDS INFO', val: faktury?.needs_info ?? 0, bad: (faktury?.needs_info ?? 0) > 0 },
+                  ].map(item => (
+                    <div key={item.label}>
+                      <div className={`text-[22px] font-bold tabular-nums leading-none ${item.bad ? 'text-red-600' : 'text-gray-800'}`}>{item.val}</div>
+                      <div className="text-[10px] text-gray-400 mt-0.5">{item.label}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Health + Critical Issues */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                <div className="bg-white rounded-2xl border border-gray-100 px-5 py-5 space-y-4">
                   <div className="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Zdraví systému</div>
-                  <ScoreBar label="Účetnictví" value={sh2.accounting_quality} color={sh2.accounting_quality >= 80 ? 'text-green-600' : 'text-amber-600'} />
-                  <ScoreBar label="Audit" value={sh2.audit_quality} color={sh2.audit_quality >= 80 ? 'text-green-600' : 'text-amber-600'} />
-                  <ScoreBar label="Workflow" value={sh2.workflow_quality} color={sh2.workflow_quality >= 80 ? 'text-green-600' : 'text-amber-600'} />
-                  <ScoreBar label="Data" value={sh2.data_quality} color={sh2.data_quality >= 80 ? 'text-green-600' : 'text-amber-600'} />
-                  <ScoreBar label="Learning" value={sh2.learning_quality} color={sh2.learning_quality >= 80 ? 'text-green-600' : 'text-amber-600'} />
+                  <ScoreBar label="Účetnictví" value={sh2.accounting_quality} reasons={accReasons} />
+                  <ScoreBar label="Audit" value={sh2.audit_quality} reasons={auditReasons} />
+                  <ScoreBar label="Workflow" value={sh2.workflow_quality} reasons={workflowReasons} />
+                  <ScoreBar label="Data" value={sh2.data_quality} reasons={dataReasons} />
+                  <ScoreBar label="Learning" value={sh2.learning_quality} />
                 </div>
 
-                {/* Critical issues */}
                 <div className="bg-white rounded-2xl border border-gray-100 px-5 py-5">
-                  <div className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-3">Kritické problémy</div>
+                  <div className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-3">Problémy</div>
                   {critical_issues?.length > 0 ? (
                     <div className="space-y-2">
                       {critical_issues.slice(0, 5).map((issue, i) => (
@@ -363,7 +508,8 @@ export default function ControlTowerPage() {
                             <span className="text-[10px] font-bold text-gray-500 uppercase">{issue.owner_agent}</span>
                           </div>
                           <div className="text-[12px] font-medium text-gray-800">{issue.title}</div>
-                          <div className="text-[11px] text-gray-500 mt-0.5">{issue.recommended_fix}</div>
+                          <div className="text-[11px] text-gray-500 mt-0.5">{issue.symptom}</div>
+                          <div className="text-[10px] text-blue-600 mt-1 font-medium">→ {issue.recommended_fix}</div>
                         </div>
                       ))}
                     </div>
@@ -373,53 +519,22 @@ export default function ControlTowerPage() {
                 </div>
               </div>
 
-              {/* Výkonnost agentů */}
-              {ctData.agent_kpi && (
-                <div>
-                  <div className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-3">Výkonnost agentů</div>
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                    {[
-                      { key: 'accountant', label: 'ACCOUNTANT', color: 'text-blue-700', bg: 'bg-blue-50', border: 'border-blue-100' },
-                      { key: 'auditor', label: 'AUDITOR', color: 'text-purple-700', bg: 'bg-purple-50', border: 'border-purple-100' },
-                      { key: 'pm', label: 'PM', color: 'text-green-700', bg: 'bg-green-50', border: 'border-green-100' },
-                      { key: 'architect', label: 'ARCHITECT', color: 'text-amber-700', bg: 'bg-amber-50', border: 'border-amber-100' },
-                    ].map(ag => (
-                      <AgentCard
-                        key={ag.key}
-                        agentKey={ag.key}
-                        label={ag.label}
-                        color={ag.color}
-                        bg={ag.bg}
-                        border={ag.border}
-                        kpi={ctData.agent_kpi?.[ag.key]}
-                        trend={ctData.agent_trend?.[ag.key]}
-                      />
-                    ))}
-                  </div>
+              {/* Agent výkonnost */}
+              <div>
+                <div className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-3">Výkonnost agentů</div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  {(['accountant', 'auditor', 'pm', 'architect'] as const).map(key => (
+                    <AgentCard
+                      key={key}
+                      agentKey={key}
+                      label={key.toUpperCase()}
+                      kpi={ctData.agent_kpi?.[key]}
+                      trend={ctData.agent_trend?.[key]}
+                      snapshot={snap}
+                    />
+                  ))}
                 </div>
-              )}
-
-              {/* KPI by agent */}
-              {kpi_by_agent?.length > 0 && (
-                <div>
-                  <div className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-3">Hodnocení agentů</div>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {kpi_by_agent.map((a, i) => (
-                      <div key={i} className={`bg-white rounded-2xl border px-4 py-3 ${a.risk_level === 'high' ? 'border-red-200' : a.risk_level === 'medium' ? 'border-amber-200' : 'border-gray-100'}`}>
-                        <div className="flex items-center justify-between mb-1">
-                          <div className="text-[12px] font-bold text-gray-800">{a.agent_name}</div>
-                          <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded ${a.risk_level === 'high' ? 'bg-red-100 text-red-700' : a.risk_level === 'medium' ? 'bg-amber-100 text-amber-700' : 'bg-green-100 text-green-700'}`}>{a.risk_level}</span>
-                        </div>
-                        <div className="text-[11px] text-gray-500">{a.performance_summary}</div>
-                        <div className="flex gap-3 mt-1.5 text-[10px]">
-                          <span className="text-green-600">{a.strongest_area}</span>
-                          <span className="text-red-500">{a.weakest_area}</span>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
+              </div>
 
               {/* Quick wins */}
               {quick_wins?.length > 0 && (
