@@ -354,6 +354,7 @@ export default function Home() {
   const [faktury, setFaktury] = useState<Faktura[]>([])
   const [loading, setLoading] = useState(true)
   const [tab, setTab] = useState<Tab>('nova')
+  const [onlyProblematic, setOnlyProblematic] = useState(false)
   const [processing, setProcessing] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [kategorieList, setKategorieList] = useState<Kategorie[]>([])
@@ -583,7 +584,10 @@ export default function Home() {
     nesparovana_mena: string
   }[] | null>(null)
   const filtered = (() => {
-    const base = tab === 'vse' ? faktury : isTransakceTab ? [] : faktury.filter(f => f.stav === tab)
+    let base = tab === 'vse' ? faktury : isTransakceTab ? [] : faktury.filter(f => f.stav === tab)
+    if (tab === 'nova' && onlyProblematic) {
+      base = base.filter(f => !f.kategorie_id || f.stav_workflow === 'NEEDS_INFO')
+    }
     if (dodavatelSearch.trim()) {
       const q = dodavatelSearch.trim().toLowerCase()
       return base.filter(f => {
@@ -1351,6 +1355,40 @@ export default function Home() {
                       ))}
                     </div>
                   )}
+                </div>
+              )
+            })()}
+
+            {/* Summary + filter — only for nova tab */}
+            {tab === 'nova' && !loading && (() => {
+              const bezKat = faktury.filter(f => f.stav === 'nova' && !f.kategorie_id).length
+              const needsInfo = faktury.filter(f => f.stav === 'nova' && f.stav_workflow === 'NEEDS_INFO').length
+              const hasIssues = bezKat > 0 || needsInfo > 0
+              if (!hasIssues && !onlyProblematic) return null
+              return (
+                <div className="flex items-center justify-between gap-3 mb-4 px-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {bezKat > 0 && (
+                      <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2.5 py-1 rounded-full bg-orange-50 text-orange-700 border border-orange-200">
+                        <span className="font-bold">{bezKat}</span> bez kategorie
+                      </span>
+                    )}
+                    {needsInfo > 0 && (
+                      <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2.5 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
+                        <span className="font-bold">{needsInfo}</span> čeká na info
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => setOnlyProblematic(p => !p)}
+                    className={`text-[11px] font-medium px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap ${
+                      onlyProblematic
+                        ? 'bg-[#0071e3] text-white'
+                        : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                    }`}
+                  >
+                    {onlyProblematic ? 'Zobrazit vše' : 'Pouze k řešení'}
+                  </button>
                 </div>
               )
             })()}

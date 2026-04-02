@@ -45,9 +45,12 @@ export default function ActionsPage() {
       try {
         const actions: ActionItem[] = []
 
-        // Faktury bez kategorie
-        const bezKatRes = await fetch(`/api/faktury?stav=nova&bez_kategorie=1&year=${year}`)
-        const bezKat = await bezKatRes.json().catch(() => [])
+        // Faktury bez kategorie (nova, bez kategorie_id)
+        const bezKatRes = await fetch(`/api/faktury?rok=${year}`)
+        const bezKatAll = await bezKatRes.json().catch(() => [])
+        const bezKat = Array.isArray(bezKatAll)
+          ? bezKatAll.filter((f: Record<string, unknown>) => f.stav === 'nova' && !f.kategorie_id)
+          : []
         if (Array.isArray(bezKat)) {
           bezKat.slice(0, 10).forEach((f: Record<string, unknown>) => {
             actions.push({
@@ -63,8 +66,11 @@ export default function ActionsPage() {
         }
 
         // Nespárované transakce (odchozí)
-        const txRes = await fetch(`/api/transakce?stav=nesparovano&year=${year}`)
-        const tx = await txRes.json().catch(() => [])
+        const txRes = await fetch(`/api/transakce?rok=${year}`)
+        const txAll = await txRes.json().catch(() => [])
+        const tx = Array.isArray(txAll)
+          ? txAll.filter((t: Record<string, unknown>) => t.stav === 'nesparovano')
+          : []
         if (Array.isArray(tx)) {
           tx.filter((t: Record<string, unknown>) => Number(t.castka) < 0).slice(0, 10).forEach((t: Record<string, unknown>) => {
             actions.push({
