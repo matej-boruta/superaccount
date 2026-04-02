@@ -1346,8 +1346,8 @@ export default function Home() {
                   </div>
                   {pairedBannerExpanded && (
                     <div className="flex flex-col gap-0.5 mt-2">
-                      {pairedBanner.map(item => (
-                        <div key={item.dodavatel} className="flex items-center gap-2 text-[13px] text-[#0055a5]">
+                      {pairedBanner.map((item, i) => (
+                        <div key={`${item.dodavatel}_${i}`} className="flex items-center gap-2 text-[13px] text-[#0055a5]">
                           <span className="font-medium flex-1">{item.dodavatel}</span>
                           <span className="text-[#3a7abf]">{item.count} {item.count === 1 ? 'faktura' : item.count < 5 ? 'faktury' : 'faktur'}</span>
                           <span className="font-semibold">{fmt(item.castka)}</span>
@@ -1733,8 +1733,8 @@ export default function Home() {
                       </tr>
                     </thead>
                     <tbody>
-                      {chybejici.map(item => (
-                        <tr key={item.dodavatel} className="border-b border-gray-50 hover:bg-red-50/30">
+                      {chybejici.map((item, i) => (
+                        <tr key={`${item.dodavatel}_${i}`} className="border-b border-gray-50 hover:bg-red-50/30">
                           <td className="px-5 py-3 font-medium text-gray-800">{item.dodavatel}</td>
                           <td className="px-5 py-3 text-gray-700 text-[12px] font-medium">{item.chybi_mesic_nazev}</td>
                           <td className="px-5 py-3 text-right text-gray-600">{item.nesparovana_count}</td>

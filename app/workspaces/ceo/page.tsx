@@ -135,7 +135,7 @@ export default function CeoWorkspace() {
               </thead>
               <tbody>
                 {top10.map((row, i) => (
-                  <tr key={row.dodavatel} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/50 transition-colors">
+                  <tr key={`${row.dodavatel}_${i}`} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/50 transition-colors">
                     <td className="px-5 py-2.5 text-[12px] text-gray-400 tabular-nums">{i + 1}</td>
                     <td className="px-5 py-2.5 text-[12px] text-gray-800 font-medium">{row.dodavatel}</td>
                     <td className="px-5 py-2.5 text-[12px] text-gray-500 tabular-nums text-right">{row.count}</td>
