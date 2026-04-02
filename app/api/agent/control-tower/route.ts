@@ -545,6 +545,60 @@ Vrať přesně tento JSON (vyplň hodnoty):
     created_at: k.created_at,
   }))
 
+  // ── 7. Ulož KPI měření do agent_kpi_measurements ─────────────────────────
+  // Fire-and-forget — neblokuje odpověď
+  ;(async () => {
+    try {
+      // Načti KPI definice
+      const kpiDefsRes = await fetch(`${SUPABASE_URL}/rest/v1/agent_kpis?select=id,key&active=eq.true`, {
+        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, Range: '0-99' },
+      })
+      const kpiDefs: Array<{ id: string; key: string }> = await kpiDefsRes.json().catch(() => [])
+      if (!Array.isArray(kpiDefs) || kpiDefs.length === 0) return
+
+      const today = new Date().toISOString().split('T')[0]
+      const acc = agentKpiSummary['accountant'] ?? { error_rate_pct: 0, fix_rate_pct: 0, total_decisions: 0 }
+      const aud = agentKpiSummary['auditor'] ?? { error_rate_pct: 0, fix_rate_pct: 0, auditor_false_neg: 0, total_decisions: 0 }
+
+      const kpiValues: Record<string, number> = {
+        acc_classification_rate: Math.round((withKategorie.length / (totalFaktury)) * 100),
+        acc_error_rate: acc.error_rate_pct,
+        aud_false_negative_rate: aud.error_rate_pct,
+        aud_fix_rate: acc.fix_rate_pct,
+        pm_coverage_rate: dataQuality,
+        pm_unmatched_txn: nesparovane.length,
+        sys_health_pct: overallScore,
+        abra_sync_delta: 0, // aktualizováno ABRA reconcile, zde 0
+      }
+
+      const measurements = kpiDefs
+        .filter(d => kpiValues[d.key] !== undefined)
+        .map(d => {
+          const val = kpiValues[d.key]
+          const status =
+            d.key === 'pm_unmatched_txn' || d.key === 'abra_sync_delta'
+              ? val === 0 ? 'good' : val <= 3 ? 'warning' : 'bad'
+              : d.key === 'acc_error_rate' || d.key === 'aud_false_negative_rate'
+              ? val <= 5 ? 'good' : val <= 10 ? 'warning' : 'bad'
+              : val >= 80 ? 'good' : val >= 60 ? 'warning' : 'bad'
+          return { kpi_id: d.id, period_from: today, period_to: today, value: val, status }
+        })
+
+      if (measurements.length > 0) {
+        await fetch(`${SUPABASE_URL}/rest/v1/agent_kpi_measurements`, {
+          method: 'POST',
+          headers: {
+            apikey: SUPABASE_KEY,
+            Authorization: `Bearer ${SUPABASE_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal',
+          },
+          body: JSON.stringify(measurements),
+        })
+      }
+    } catch { /* silent — KPI save neblokuje CT */ }
+  })()
+
   return NextResponse.json({
     ok: true,
     snapshot: systemSnapshot,

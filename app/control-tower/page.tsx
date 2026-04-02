@@ -2,6 +2,98 @@
 
 import { useEffect, useState, useCallback } from 'react'
 
+// ── KPI line chart ────────────────────────────────────────────────────────────
+
+type KpiPoint = { date: string; value: number; status: string }
+type KpiDef = { id: string; key: string; name: string; owner_role: string; target_value: number | null; unit: string | null }
+
+const KPI_COLORS: Record<string, string> = {
+  accountant: '#3b82f6',
+  auditor: '#8b5cf6',
+  pm: '#10b981',
+  architect: '#f59e0b',
+  orchestrator: '#6366f1',
+}
+
+function LineChart({ points, target, unit, color }: {
+  points: KpiPoint[]
+  target: number | null
+  unit: string | null
+  color: string
+}) {
+  if (points.length === 0) return (
+    <div className="h-20 flex items-center justify-center text-[11px] text-gray-400">Žádná data</div>
+  )
+
+  const W = 280, H = 72, PAD = { t: 8, r: 8, b: 20, l: 32 }
+  const iw = W - PAD.l - PAD.r
+  const ih = H - PAD.t - PAD.b
+
+  // value range
+  const vals = points.map(p => p.value)
+  const hasTarget = target !== null
+  const allVals = hasTarget ? [...vals, target] : vals
+  const minV = Math.min(...allVals)
+  const maxV = Math.max(...allVals)
+  const range = maxV - minV || 1
+
+  const x = (i: number) => PAD.l + (i / Math.max(points.length - 1, 1)) * iw
+  const y = (v: number) => PAD.t + ih - ((v - minV) / range) * ih
+
+  const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(' ')
+
+  // Labels: show first, last, and every N-th
+  const step = Math.ceil(points.length / 4)
+  const labelIdxs = new Set([0, points.length - 1])
+  for (let i = step; i < points.length - 1; i += step) labelIdxs.add(i)
+
+  return (
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} className="overflow-visible w-full">
+      {/* grid lines */}
+      {[0, 0.5, 1].map(t => {
+        const yy = (PAD.t + ih * (1 - t)).toFixed(1)
+        const val = (minV + range * t).toFixed(unit === '%' ? 0 : 1)
+        return (
+          <g key={t}>
+            <line x1={PAD.l} x2={W - PAD.r} y1={yy} y2={yy} stroke="#e5e7eb" strokeWidth="1" />
+            <text x={PAD.l - 4} y={Number(yy) + 3} textAnchor="end" fontSize="8" fill="#9ca3af">{val}</text>
+          </g>
+        )
+      })}
+      {/* target line */}
+      {hasTarget && (
+        <line
+          x1={PAD.l} x2={W - PAD.r}
+          y1={y(target!).toFixed(1)} y2={y(target!).toFixed(1)}
+          stroke={color} strokeWidth="1" strokeDasharray="3 3" opacity="0.5"
+        />
+      )}
+      {/* area fill */}
+      <path
+        d={`${pathD} L${x(points.length - 1).toFixed(1)},${(PAD.t + ih).toFixed(1)} L${PAD.l.toFixed(1)},${(PAD.t + ih).toFixed(1)} Z`}
+        fill={color} fillOpacity="0.08"
+      />
+      {/* line */}
+      <path d={pathD} stroke={color} strokeWidth="1.5" fill="none" strokeLinejoin="round" strokeLinecap="round" />
+      {/* dots */}
+      {points.map((p, i) => (
+        <circle key={i} cx={x(i)} cy={y(p.value)} r="2.5" fill={color}
+          opacity={p.status === 'bad' ? 1 : 0.7}
+          stroke={p.status === 'bad' ? '#ef4444' : p.status === 'warning' ? '#f59e0b' : 'none'}
+          strokeWidth="1.5">
+          <title>{p.date}: {p.value}{unit}</title>
+        </circle>
+      ))}
+      {/* x labels */}
+      {[...labelIdxs].map(i => (
+        <text key={i} x={x(i)} y={H - 2} textAnchor="middle" fontSize="8" fill="#9ca3af">
+          {points[i].date.slice(5)}
+        </text>
+      ))}
+    </svg>
+  )
+}
+
 // ── typy ──────────────────────────────────────────────────────────────────────
 
 type CtData = {
@@ -111,6 +203,8 @@ export default function ControlTowerPage() {
   const [loading, setLoading] = useState(false)
   const [loadingAbra, setLoadingAbra] = useState(false)
   const [tab, setTab] = useState<'dashboard' | 'orchestrator' | 'abra' | 'agent'>('dashboard')
+  const [kpiHistory, setKpiHistory] = useState<{ kpis: KpiDef[]; series: Record<string, KpiPoint[]> } | null>(null)
+  const [kpiLoading, setKpiLoading] = useState(false)
 
   // Strategic Orchestrator
   const [orchRunning, setOrchRunning] = useState(false)
@@ -142,7 +236,16 @@ export default function ControlTowerPage() {
     setLoadingAbra(false)
   }, [year])
 
-  useEffect(() => { load(); loadAbra() }, [load, loadAbra])
+  const loadKpi = useCallback(async () => {
+    setKpiLoading(true)
+    try {
+      const res = await fetch('/api/agent/kpi-history')
+      setKpiHistory(await res.json())
+    } catch { /* silent */ }
+    setKpiLoading(false)
+  }, [])
+
+  useEffect(() => { load(); loadAbra(); loadKpi() }, [load, loadAbra, loadKpi])
 
   const runOrch = async (dryRun = false) => {
     if (orchRunning) return
@@ -333,6 +436,52 @@ export default function ControlTowerPage() {
                   </div>
                 </div>
               )}
+
+              {/* KPI trend grafy */}
+              {kpiHistory && kpiHistory.kpis?.length > 0 && (() => {
+                const { kpis, series } = kpiHistory
+                const byRole: Record<string, KpiDef[]> = {}
+                for (const k of kpis) {
+                  if (!byRole[k.owner_role]) byRole[k.owner_role] = []
+                  byRole[k.owner_role].push(k)
+                }
+                return (
+                  <div>
+                    <div className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-3">KPI v čase</div>
+                    <div className="space-y-4">
+                      {Object.entries(byRole).map(([role, rolekpis]) => {
+                        const color = KPI_COLORS[role] ?? '#6b7280'
+                        return (
+                          <div key={role} className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+                            <div className="px-5 py-2.5 border-b border-gray-50 flex items-center gap-2">
+                              <span className="w-2 h-2 rounded-full shrink-0" style={{ background: color }} />
+                              <span className="text-[11px] font-bold text-gray-500 uppercase tracking-wider">{role}</span>
+                            </div>
+                            <div className="grid grid-cols-2 lg:grid-cols-4 divide-x divide-gray-50">
+                              {rolekpis.map(kpi => {
+                                const pts = series[kpi.key] ?? []
+                                const last = pts[pts.length - 1]
+                                const statusColor = !last ? 'text-gray-400' : last.status === 'bad' ? 'text-red-600' : last.status === 'warning' ? 'text-amber-600' : 'text-green-600'
+                                return (
+                                  <div key={kpi.key} className="px-4 py-3">
+                                    <div className="flex items-baseline justify-between mb-1 gap-1">
+                                      <div className="text-[10px] text-gray-500 truncate flex-1">{kpi.name}</div>
+                                      <div className={`text-[13px] font-bold tabular-nums shrink-0 ${statusColor}`}>
+                                        {last ? `${last.value}${kpi.unit ?? ''}` : '—'}
+                                      </div>
+                                    </div>
+                                    <LineChart points={pts} target={kpi.target_value} unit={kpi.unit} color={color} />
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )
+              })()}
             </div>
           )
         })()}
@@ -489,6 +638,7 @@ export default function ControlTowerPage() {
             <PmAgentTab year={year} />
           </div>
         )}
+
 
         {!loading && !ctData && tab === 'dashboard' && (
           <div className="text-center py-16">
