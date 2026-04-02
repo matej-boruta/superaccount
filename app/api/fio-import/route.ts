@@ -87,17 +87,30 @@ export async function POST(req: Request) {
         continue
       }
 
-      const sbRes = await fetch(`${SUPABASE_URL}/rest/v1/transakce`, {
-        method: 'POST',
-        headers: SB_HEADERS,
-        body: JSON.stringify(rows),
-      })
+      // Batch insert po 100 (Supabase má limit na velikost requestu)
+      const BATCH = 100
+      let saved = 0
+      let batchError: string | undefined
+      for (let b = 0; b < rows.length; b += BATCH) {
+        const chunk = rows.slice(b, b + BATCH)
+        const sbRes = await fetch(`${SUPABASE_URL}/rest/v1/transakce?on_conflict=fio_id`, {
+          method: 'POST',
+          headers: { ...SB_HEADERS, Prefer: 'resolution=ignore-duplicates,return=minimal' },
+          body: JSON.stringify(chunk),
+        })
+        if (sbRes.ok) {
+          saved += chunk.length
+        } else {
+          batchError = `HTTP ${sbRes.status} (batch ${Math.floor(b / BATCH) + 1})`
+          break
+        }
+      }
 
       log.push({
         ucet: label,
         count: rows.length,
-        saved: sbRes.ok ? rows.length : 0,
-        error: sbRes.ok ? undefined : `HTTP ${sbRes.status}`,
+        saved,
+        error: batchError,
       })
     } catch (e) {
       log.push({ ucet: label, count: 0, saved: 0, error: String(e) })
