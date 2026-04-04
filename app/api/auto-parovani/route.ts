@@ -510,11 +510,13 @@ export async function POST() {
     }
 
     // Match found — pair all candidates to this invoice
-    // 1. Create one faktura-prijata in ABRA for the whole invoice
+    // conf < 90 → navrzeno (čeká na lidské potvrzení), conf >= 90 → sparovano ihned
+    const isAutoConf = rule.confidence >= 90
+
     let abraFaId: string | null = null
-    try {
-      abraFaId = await createAbraFakturaPrijata(f, true)
-    } catch { /* non-blocking */ }
+    if (isAutoConf) {
+      try { abraFaId = await createAbraFakturaPrijata(f, true) } catch { /* non-blocking */ }
+    }
 
     let firstPair = true
     for (const t of candidates) {
@@ -522,29 +524,38 @@ export async function POST() {
       const transakceId = t.id as number
       const tCastka = Math.abs(Number(t.castka))
 
-      await fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}`, {
-        method: 'PATCH',
-        headers: SB_HEADERS,
-        body: JSON.stringify({ stav: 'sparovano', faktura_id: fakturaId }),
-      })
-
-      if (firstPair) {
+      if (isAutoConf) {
+        await fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}`, {
+          method: 'PATCH',
+          headers: SB_HEADERS,
+          body: JSON.stringify({ stav: 'sparovano', faktura_id: fakturaId }),
+        })
+        if (firstPair) {
+          await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}`, {
+            method: 'PATCH',
+            headers: SB_HEADERS,
+            body: JSON.stringify({ stav: 'zaplacena', stav_workflow: 'POSTED', zauctovano_at: new Date().toISOString() }),
+          })
+          firstPair = false
+        }
+        if (abraFaId) {
+          try { await createAbraBanka(f, t, abraFaId, tCastka) } catch { /* non-blocking */ }
+        }
+        results.push({ faktura_id: fakturaId, transakce_id: transakceId, match: `mn_keyword_${rule.keyword}` })
+      } else {
+        // Navrhni — čeká na potvrzení člověka
+        await fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}`, {
+          method: 'PATCH',
+          headers: SB_HEADERS,
+          body: JSON.stringify({ stav: 'navrzeno', faktura_id: fakturaId }),
+        })
         await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}`, {
           method: 'PATCH',
           headers: SB_HEADERS,
-          body: JSON.stringify({ stav: 'zaplacena', stav_workflow: 'POSTED', zauctovano_at: new Date().toISOString() }),
+          body: JSON.stringify({ stav_workflow: 'PAROVANI_NAVRZENO', blocker: `Navrženo párování (conf ${rule.confidence}%) — potvrď manuálně` }),
         })
-        firstPair = false
+        results.push({ faktura_id: fakturaId, transakce_id: transakceId, match: `mn_navrzeno_${rule.keyword}` })
       }
-
-      // 2. Create individual banka record in ABRA for each transaction (with its own amount)
-      if (abraFaId) {
-        try {
-          await createAbraBanka(f, t, abraFaId, tCastka)
-        } catch { /* non-blocking */ }
-      }
-
-      results.push({ faktura_id: fakturaId, transakce_id: transakceId, match: `mn_keyword_${rule.keyword}` })
     }
 
     // Audit the M:N booking with Model B (fire-and-forget)
@@ -574,39 +585,54 @@ export async function POST() {
     const globalIdx = transakce.indexOf(match)
     if (globalIdx >= 0) transakce.splice(globalIdx, 1)
 
+    const matchedRule = cardRules.find(r => {
+      const zprava = String(match.zprava || '').toUpperCase()
+      return zprava.includes(r.keyword) && (r.dodavatelMatch.length === 0 || String(f.dodavatel || '').toUpperCase().includes(r.dodavatelMatch))
+    })
+    const cardConf = matchedRule?.confidence ?? 80
+    const isAutoCard = cardConf >= 90
+
     try {
-      // Create ABRA faktura-prijata (already paid → stavUhrK=uhrazenoRucne)
-      const abraFaId = await createAbraFakturaPrijata(f, true)
-
-      // Pair in Supabase
-      await pairInSupabase(fakturaId, transakceId)
-
-      // Zapiš rozodnutí párování — card match
-      const matchedRule = cardRules.find(r => {
-        const zprava = String(match.zprava || '').toUpperCase()
-        return zprava.includes(r.keyword) && (r.dodavatelMatch.length === 0 || String(f.dodavatel || '').toUpperCase().includes(r.dodavatelMatch))
-      })
-      writeRozhodnuti({
-        entity_type: 'faktura',
-        entity_id: fakturaId,
-        faktura_id: fakturaId,
-        transakce_id: transakceId,
-        typ: 'parovani',
-        agent: 'accountant',
-        pravidlo_id: matchedRule?.id ?? null,
-        navrh: { castka: f.castka_s_dph, match_type: 'card', keyword: matchedRule?.keyword },
-        confidence: matchedRule?.confidence ?? 80,
-        stav: 'accepted',
-        zdroj: 'auto_parovani',
-      }).catch(() => {})
-
-      // Create ABRA banka record
-      if (abraFaId) await createAbraBanka(f, match, abraFaId)
-
-      results.push({ faktura_id: fakturaId, transakce_id: transakceId, match: 'card' })
-
-      // Model B audit (fire-and-forget)
-      auditAbraBooking(f, '518500', '221001', Number(f.castka_s_dph), 'card').catch(() => {})
+      if (isAutoCard) {
+        // Automatické párování — conf >= 90
+        const abraFaId = await createAbraFakturaPrijata(f, true)
+        await pairInSupabase(fakturaId, transakceId)
+        writeRozhodnuti({
+          entity_type: 'faktura', entity_id: fakturaId,
+          faktura_id: fakturaId, transakce_id: transakceId,
+          typ: 'parovani', agent: 'accountant',
+          pravidlo_id: matchedRule?.id ?? null,
+          navrh: { castka: f.castka_s_dph, match_type: 'card', keyword: matchedRule?.keyword },
+          confidence: cardConf, stav: 'accepted', zdroj: 'auto_parovani',
+        }).catch(() => {})
+        if (abraFaId) await createAbraBanka(f, match, abraFaId)
+        auditAbraBooking(f, '518500', '221001', Number(f.castka_s_dph), 'card').catch(() => {})
+        results.push({ faktura_id: fakturaId, transakce_id: transakceId, match: 'card' })
+      } else {
+        // Navrhni — conf < 90, čeká na potvrzení člověka
+        await Promise.all([
+          fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}`, {
+            method: 'PATCH', headers: SB_HEADERS,
+            body: JSON.stringify({ stav: 'navrzeno', faktura_id: fakturaId }),
+          }),
+          fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}`, {
+            method: 'PATCH', headers: SB_HEADERS,
+            body: JSON.stringify({
+              stav_workflow: 'PAROVANI_NAVRZENO',
+              blocker: `Navrženo párování karta (conf ${cardConf}%) — potvrď manuálně`,
+            }),
+          }),
+        ])
+        writeRozhodnuti({
+          entity_type: 'faktura', entity_id: fakturaId,
+          faktura_id: fakturaId, transakce_id: transakceId,
+          typ: 'parovani', agent: 'accountant',
+          pravidlo_id: matchedRule?.id ?? null,
+          navrh: { castka: f.castka_s_dph, match_type: 'card_proposed', keyword: matchedRule?.keyword },
+          confidence: cardConf, stav: 'proposed', zdroj: 'auto_parovani',
+        }).catch(() => {})
+        results.push({ faktura_id: fakturaId, transakce_id: transakceId, match: 'card_navrzeno' })
+      }
     } catch { /* non-blocking */ }
   }
 
