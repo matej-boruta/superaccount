@@ -37,7 +37,7 @@ export async function POST(req: Request) {
   await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}`, {
     method: 'PATCH',
     headers: SB_HEADERS,
-    body: JSON.stringify({ stav: 'zaplacena' }),
+    body: JSON.stringify({ stav: 'zaplacena', stav_workflow: 'POSTED' }),
   })
 
   // 3. Zaúčtovat do ABRA (non-blocking)

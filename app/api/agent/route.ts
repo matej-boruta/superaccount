@@ -3,12 +3,12 @@
  *
  * Paměť agenta (Supabase):
  *   agent_knowledge    ← API přístupy, účetní pravidla, kontext systému
- *   dodavatel_pravidla ← pravidla per dodavatel (auto_schvalit, keyword, typ_platby)
+ *   pravidla ← pravidla per dodavatel (auto_schvalit, keyword, typ_platby)
  *   ucetni_vzory       ← MD/DAL vzory per IČO dodavatele (cross-company)
  *
  * Workflow pro každou novou fakturu:
  *   1. Načte kontext z agent_knowledge
- *   2. Vyhledá pravidlo v dodavatel_pravidla (nebo se naučí z historie)
+ *   2. Vyhledá pravidlo v pravidla (nebo se naučí z historie)
  *   3. Doplní kategorie_id
  *   4. auto_schvalit → vytvoří faktura-prijata v ABRA
  *   5. auto_parovat  → spáruje s bankovní transakcí + vytvoří banka v ABRA
@@ -108,7 +108,7 @@ async function sbPost(path: string, body: Record<string, unknown>) {
 let pravidlaCache: Pravidlo[] | null = null
 async function getPravidlo(dodavatel: string, ico?: string): Promise<Pravidlo | null> {
   if (!pravidlaCache) {
-    const rows = await sbGet('dodavatel_pravidla?select=*')
+    const rows = await sbGet('pravidla?select=*')
     pravidlaCache = Array.isArray(rows) ? rows : []
   }
   const upper = dodavatel.toUpperCase()
@@ -177,7 +177,7 @@ async function learnFromHistory(faktura: Faktura): Promise<Pravidlo | null> {
   }
 
   try {
-    const created = await sbPost('dodavatel_pravidla', newRule)
+    const created = await sbPost('pravidla', newRule)
     return Array.isArray(created) ? created[0] : null
   } catch {
     return null
@@ -189,7 +189,7 @@ async function updatePravidloStats(pravidloId: number, newKategorieId?: number) 
   const patch: Record<string, unknown> = {}
   if (newKategorieId) patch.kategorie_id = newKategorieId
   if (Object.keys(patch).length > 0) {
-    await sbPatch(`dodavatel_pravidla?id=eq.${pravidloId}`, patch)
+    await sbPatch(`pravidla?id=eq.${pravidloId}`, patch)
   }
 }
 

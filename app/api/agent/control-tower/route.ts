@@ -12,10 +12,10 @@ import { SYSTEM_ARCHITECT } from '@/lib/claude'
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY!
-const SB = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
+const SB = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, Range: '0-9999' }
 
 async function sb(path: string) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, { headers: SB })
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, { headers: SB, cache: 'no-store' })
   const data = await res.json()
   return Array.isArray(data) ? data : []
 }
@@ -26,16 +26,17 @@ export async function GET(req: Request) {
   const rokFilter = `datum_vystaveni=gte.${rok}-01-01&datum_vystaveni=lte.${rok}-12-31`
 
   // ── 1. Paralelní snapshot dat ─────────────────────────────────────────────
+  // agent_log skutečné sloupce: id, typ, vstup, vystup, confidence, pravidlo_zdroj, faktura_id, transakce_id, agent_id, created_at
   const [faktury, transakce, agentLog, pravidla, pravidlaUcetni, agentLogWeekly, agentKorekce] = await Promise.all([
     sb(`faktury?${rokFilter}&select=id,stav,stav_workflow,kategorie_id,castka_s_dph,variabilni_symbol,blocker,datum_splatnosti,dodavatel`),
     sb(`transakce?datum=gte.${rok}-01-01&datum=lte.${rok}-12-31&select=id,stav,castka`),
-    sb(`agent_log?created_at=gte.${rok}-01-01&select=id,typ,rezim,confidence,source_of_rule,zmena_stavu,feedback_type,created_at&order=created_at.desc&limit=200`),
-    sb(`dodavatel_pravidla?select=id,auto_schvalit,auto_parovat,kategorie_id`),
-    sb(`ucetni_pravidla?select=id,confidence,zdroj,kategorie_id`),
-    // Trend data: agent_log posledních 90 dní s datem pro týdenní agregaci
-    sb(`agent_log?created_at=gte.${rok}-01-01&select=confidence,rezim,zmena_stavu,created_at&order=created_at.asc&limit=1000`),
+    sb(`agent_log?created_at=gte.${rok}-01-01&select=id,typ,confidence,pravidlo_zdroj,vstup,created_at&order=created_at.desc&limit=500`),
+    sb(`pravidla?select=id,confidence,kategorie_id`),
+    sb(`pravidla?select=id,confidence,zdroj,kategorie_id`),
+    // Trend data: agent_log posledních 90 dní
+    sb(`agent_log?created_at=gte.${rok}-01-01&select=confidence,typ,vstup,created_at&order=created_at.asc&limit=2000`),
     // Korekce a eskalace — chyby agentů pro CT dashboard
-    sb(`agent_log?typ=in.(korekce,eskalace)&select=id,typ,rezim,confidence,feedback_type,vstup,vystup,created_at,faktura_id&order=created_at.desc&limit=30`),
+    sb(`agent_log?typ=in.(korekce,eskalace)&select=id,typ,confidence,pravidlo_zdroj,vstup,vystup,created_at,faktura_id&order=created_at.desc&limit=30`),
   ])
 
   // ── 2. Výpočet metrik ────────────────────────────────────────────────────
@@ -57,13 +58,16 @@ export async function GET(req: Request) {
   const nesparovane = transakce.filter((t: Record<string, unknown>) => t.stav === 'nesparovano' && Number(t.castka) < 0)
   const sparovane = transakce.filter((t: Record<string, unknown>) => t.stav === 'sparovano')
 
+  // agent_log: typ=eskalace/korekce/rozhodnuti, agent_id=ACCOUNTANT/AUDITOR/PM/...
+  // rezim je derivován z vstup.rezim nebo agent_id
   const logByRezim = agentLog.reduce((acc: Record<string, number>, l: Record<string, unknown>) => {
-    const r = String(l.rezim ?? 'unknown')
+    const vstup = l.vstup as Record<string, unknown> | null
+    const r = String(vstup?.rezim ?? l.agent_id ?? 'unknown').toUpperCase()
     acc[r] = (acc[r] ?? 0) + 1
     return acc
   }, {})
 
-  const logWithConfidence = agentLog.filter((l: Record<string, unknown>) => l.confidence != null)
+  const logWithConfidence = agentLog.filter((l: Record<string, unknown>) => l.confidence != null && Number(l.confidence) > 0)
   const avgConfidence = logWithConfidence.length
     ? Math.round(logWithConfidence.reduce((s: number, l: Record<string, unknown>) => s + Number(l.confidence), 0) / logWithConfidence.length)
     : 0
@@ -72,13 +76,13 @@ export async function GET(req: Request) {
   const lowConfLogs = logWithConfidence.filter((l: Record<string, unknown>) => Number(l.confidence) < 60).length
   const midConfLogs = logWithConfidence.filter((l: Record<string, unknown>) => Number(l.confidence) >= 60 && Number(l.confidence) < 85).length
 
-  const feedbackTypes = agentLog.reduce((acc: Record<string, number>, l: Record<string, unknown>) => {
-    if (l.feedback_type) {
-      const ft = String(l.feedback_type)
-      acc[ft] = (acc[ft] ?? 0) + 1
-    }
-    return acc
-  }, {})
+  // korekce = accountant udělal chybu (auditor/user ji opravil)
+  const korekceLogs = agentLog.filter((l: Record<string, unknown>) => l.typ === 'korekce')
+  const eskalaceLogs = agentLog.filter((l: Record<string, unknown>) => l.typ === 'eskalace')
+  const feedbackTypes: Record<string, number> = {
+    korekce: korekceLogs.length,
+    eskalace: eskalaceLogs.length,
+  }
 
   const manualPravidla = pravidlaUcetni.filter((p: Record<string, unknown>) => p.zdroj === 'manual').length
   const agentPravidla = pravidlaUcetni.filter((p: Record<string, unknown>) => p.zdroj === 'agent').length
@@ -98,7 +102,7 @@ export async function GET(req: Request) {
 
   const auditQuality = Math.min(100, Math.round(
     (highConfLogs / (logWithConfidence.length || 1)) * 60 +
-    (agentLog.filter((l: Record<string, unknown>) => l.zmena_stavu?.toString().includes('AUDIT')).length > 0 ? 40 : 10)
+    (korekceLogs.length > 0 ? 40 : 10)  // auditujeme korekce
   ))
 
   const workflowQuality = Math.min(100, Math.round(
@@ -115,8 +119,8 @@ export async function GET(req: Request) {
 
   const architectureQuality = Math.min(100, Math.round(
     (withWorkflow.length > 0 ? 40 : 0) +
-    (agentLog.filter((l: Record<string, unknown>) => l.source_of_rule).length / (agentLog.length || 1)) * 30 +
-    (agentLog.filter((l: Record<string, unknown>) => l.feedback_type).length > 0 ? 30 : 10)
+    (agentLog.filter((l: Record<string, unknown>) => l.pravidlo_zdroj).length / (agentLog.length || 1)) * 30 +
+    (korekceLogs.length > 0 || eskalaceLogs.length > 0 ? 30 : 10)
   ))
 
   const learningQuality = Math.min(100, Math.round(
@@ -162,22 +166,19 @@ export async function GET(req: Request) {
     }))
 
   // ── Per-agent KPI — chybovost, opravovost, false negatives ──────────────
-  // Semantika agent_log.typ:
-  //   typ='korekce', rezim='ACCOUNTANT' → ACC udělal chybu (AUDITOR ji vrátil)
-  //   typ='korekce', rezim='AUDITOR'    → AUDITOR propustil chybu (false negative)
-  //   typ='rozhodnuti', rezim='ACCOUNTANT', zmena_stavu='CORRECTED' → ACC chybu opravil
-  //   typ='rozhodnuti', rezim='AUDITOR'  → AUDITOR schválil (normální průchod)
+  // agent_log.vstup může obsahovat { rezim: 'ACCOUNTANT' } nebo agent_id=superaccount
+  // typ='korekce' → chyba agenta; typ='eskalace' → neznámý případ; typ='rozhodnuti' → normální průchod
 
   const REZIM_LIST = ['ACCOUNTANT', 'AUDITOR', 'PM', 'ARCHITECT'] as const
 
   type AgentTrendBucket = {
     week: string
     avg_confidence: number
-    decisions: number            // celkem rozhodnutí
-    acc_errors: number           // chyby ACC (vráceno AUDITOREM)
-    auditor_false_neg: number    // chyby AUDITORA (propustil chybu)
-    fixed: number                // ACC opravil flagovanou chybu
-    error_rate_pct: number       // chybovost v %
+    decisions: number
+    acc_errors: number
+    auditor_false_neg: number
+    fixed: number
+    error_rate_pct: number
   }
 
   const agentWeekBuckets: Record<string, Map<string, {
@@ -192,41 +193,28 @@ export async function GET(req: Request) {
     return `${d.getFullYear()}-W${String(weekNum).padStart(2, '0')}`
   }
 
-  // Procházíme všechny logy (agentLogWeekly má víc záznamů)
+  function getRezimFromLog(l: Record<string, unknown>): string {
+    const vstup = l.vstup as Record<string, unknown> | null
+    return String(vstup?.rezim ?? l.agent_id ?? 'unknown').toUpperCase()
+  }
+
+  // Procházíme všechny logy
   for (const l of Array.isArray(agentLogWeekly) ? agentLogWeekly : []) {
     if (!l.created_at) continue
-    const rezim = String(l.rezim ?? '').toUpperCase()
+    const rezim = getRezimFromLog(l)
     const key = weekKey(String(l.created_at))
 
-    // Confidence agregace (všechny rezim)
     if (agentWeekBuckets[rezim]) {
       const prev = agentWeekBuckets[rezim].get(key) ?? { sumConf: 0, decisions: 0, acc_errors: 0, auditor_false_neg: 0, fixed: 0 }
-      if (l.confidence != null) { prev.sumConf += Number(l.confidence); prev.decisions++ }
+      if (l.confidence != null && Number(l.confidence) > 0) { prev.sumConf += Number(l.confidence); prev.decisions++ }
 
       const typ = String(l.typ ?? '')
-      const zmena = String(l.zmena_stavu ?? '')
-
       if (typ === 'korekce' && rezim === 'ACCOUNTANT') prev.acc_errors++
       if (typ === 'korekce' && rezim === 'AUDITOR') prev.auditor_false_neg++
-      if (typ === 'rozhodnuti' && rezim === 'ACCOUNTANT' && zmena === 'CORRECTED') prev.fixed++
+      if (typ === 'rozhodnuti' && rezim === 'ACCOUNTANT') prev.fixed++
 
       agentWeekBuckets[rezim].set(key, prev)
     }
-  }
-
-  // Přidáme korekce z agentLog (limit 200, přesnější typ data)
-  for (const l of Array.isArray(agentLog) ? agentLog : []) {
-    if (!l.created_at || !l.rezim) continue
-    const rezim = String(l.rezim).toUpperCase()
-    if (!agentWeekBuckets[rezim]) continue
-    const key = weekKey(String(l.created_at))
-    const prev = agentWeekBuckets[rezim].get(key) ?? { sumConf: 0, decisions: 0, acc_errors: 0, auditor_false_neg: 0, fixed: 0 }
-
-    if (l.typ === 'korekce' && rezim === 'ACCOUNTANT') prev.acc_errors++
-    if (l.typ === 'korekce' && rezim === 'AUDITOR') prev.auditor_false_neg++
-    if (l.typ === 'rozhodnuti' && rezim === 'ACCOUNTANT' && String(l.zmena_stavu ?? '') === 'CORRECTED') prev.fixed++
-
-    agentWeekBuckets[rezim].set(key, prev)
   }
 
   const agentTrend: Record<string, AgentTrendBucket[]> = {}
@@ -275,6 +263,75 @@ export async function GET(req: Request) {
     }
   }
 
+  // ── 4b. Accountant TOP 5 KPI ────────────────────────────────────────────────
+  // KPI 1: Accuracy — % rozhodnutí bez korekce
+  const accountantLogs = agentLog.filter((l: Record<string, unknown>) => {
+    const agId = String((l.agent_id ?? (l.vstup as Record<string, unknown>)?.rezim ?? '')).toLowerCase()
+    return l.typ === 'rozhodnuti' && (agId.includes('account') || agId === 'superaccount')
+  })
+  const korekceFakturaIds = new Set(
+    agentLog
+      .filter((l: Record<string, unknown>) => l.typ === 'korekce' && l.faktura_id)
+      .map((l: Record<string, unknown>) => l.faktura_id)
+  )
+  const accDecisionsBezKorekce = accountantLogs.filter(
+    (l: Record<string, unknown>) => !korekceFakturaIds.has(l.faktura_id)
+  )
+  const accuracy = accountantLogs.length > 0
+    ? Math.round((accDecisionsBezKorekce.length / accountantLogs.length) * 100)
+    : null
+
+  // KPI 2: Auto-rate — % bez lidského zásahu (zaplacena automaticky nebo schválena bez NEEDS_INFO)
+  const processedFaktury = [...schvalena, ...zaplacena, ...zamitnuta]
+  const needsInfoIds = new Set(needsInfo.map((f: Record<string, unknown>) => f.id))
+  const autoProcessed = processedFaktury.filter((f: Record<string, unknown>) => !needsInfoIds.has(f.id)).length
+  const autoRate = faktury.length > 0
+    ? Math.round((autoProcessed / faktury.length) * 100)
+    : null
+
+  // KPI 3: High-confidence accuracy — conf ≥ 90 bez korekce
+  const highConfDecisions = accountantLogs.filter(
+    (l: Record<string, unknown>) => Number(l.confidence) >= 90
+  )
+  const highConfErrors = highConfDecisions.filter(
+    (l: Record<string, unknown>) => korekceFakturaIds.has(l.faktura_id)
+  )
+  const highConfAccuracy = highConfDecisions.length > 0
+    ? Math.round(((highConfDecisions.length - highConfErrors.length) / highConfDecisions.length) * 100)
+    : null
+
+  // KPI 4: Repeat error rate — % chyb od stejného dodavatele opakovaně
+  const korekceDodavatele: Record<string, number> = {}
+  for (const l of korekceLogs) {
+    const vstup = l.vstup as Record<string, unknown> | null
+    const d = String(vstup?.dodavatel ?? vstup?.ico ?? '').toLowerCase()
+    if (d) korekceDodavatele[d] = (korekceDodavatele[d] ?? 0) + 1
+  }
+  const repeatErrorCount = Object.values(korekceDodavatele).filter(c => c > 1).reduce((s, c) => s + (c - 1), 0)
+  const repeatErrorRate = korekceLogs.length > 0
+    ? Math.round((repeatErrorCount / korekceLogs.length) * 100)
+    : 0
+
+  // KPI 5: Feedback → rule conversion — % feedbacků vedoucích ke vzniku pravidla
+  const feedbackCount = agentLog.filter((l: Record<string, unknown>) => l.typ === 'feedback').length
+  const feedbackConversion = feedbackCount > 0
+    ? Math.min(100, Math.round((agentPravidla / feedbackCount) * 100))
+    : null
+
+  const accountantKpi = {
+    accuracy,           // % rozhodnutí bez korekce (cíl: >90)
+    auto_rate: autoRate, // % bez člověka (cíl: >80)
+    high_conf_accuracy: highConfAccuracy, // conf≥90 bez korekce (cíl: >97)
+    repeat_error_rate: repeatErrorRate,   // % opakovaných chyb (cíl: <2, ↓)
+    feedback_conversion: feedbackConversion, // feedback→pravidlo (cíl: >60)
+    // Pomocné hodnoty pro debug
+    _total_decisions: accountantLogs.length,
+    _corrections: korekceLogs.length,
+    _high_conf_decisions: highConfDecisions.length,
+    _feedback_count: feedbackCount,
+    _agent_rules: agentPravidla,
+  }
+
   // ── 5. Sestavení kontextu pro Claude ─────────────────────────────────────
   const systemSnapshot = {
     rok,
@@ -290,6 +347,7 @@ export async function GET(req: Request) {
       overdue: overdueFaktury.length,
     },
     transakce: {
+      total: transakce.length,
       sparovane: sparovane.length,
       nesparovane: nesparovane.length,
       parovani_rate_pct: Math.round(sparovane.length / (sparovane.length + nesparovane.length || 1) * 100),
@@ -297,15 +355,15 @@ export async function GET(req: Request) {
     agent_log: {
       total: agentLog.length,
       by_rezim: logByRezim,
-      avg_confidence: avgConfidence,
+      avg_confidence: logWithConfidence.length > 0 ? avgConfidence : null,
       high_conf_pct: Math.round(highConfLogs / (logWithConfidence.length || 1) * 100),
       low_conf_pct: Math.round(lowConfLogs / (logWithConfidence.length || 1) * 100),
       mid_conf_pct: Math.round(midConfLogs / (logWithConfidence.length || 1) * 100),
       feedback_types: feedbackTypes,
     },
     pravidla: {
-      dodavatel_pravidla: pravidla.length,
-      ucetni_pravidla_total: pravidlaUcetni.length,
+      pravidla: pravidla.length,
+      pravidla_total: pravidlaUcetni.length,
       manual: manualPravidla,
       agent: agentPravidla,
       pending_approval: pendingPravidla,
@@ -608,6 +666,7 @@ Vrať přesně tento JSON (vyplň hodnoty):
     agent_errors: agentErrors,
     agent_trend: agentTrend,
     agent_kpi: agentKpiSummary,
+    accountant_kpi: accountantKpi,
     generated_at: new Date().toISOString(),
   })
 }

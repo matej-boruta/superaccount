@@ -17,7 +17,7 @@ const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY!
-const DRIVE_FOLDER_ID = '19uD7bGxQTbDLn57L4tpBtH-9bG4lYXl8'
+const DRIVE_FOLDER_ID = '1vCbrmWcLhDR54KVL0EHYaDLg2Qr2RCsM' // ORG.fakturace.ucet 2026 (root)
 
 const SB = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
 

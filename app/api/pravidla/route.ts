@@ -6,7 +6,7 @@ const SB = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
 
 export async function GET() {
   const res = await fetch(
-    `${SUPABASE_URL}/rest/v1/dodavatel_pravidla?select=*&order=id`,
+    `${SUPABASE_URL}/rest/v1/pravidla?select=*&order=id`,
     { headers: SB }
   )
   const data = await res.json()
@@ -15,7 +15,7 @@ export async function GET() {
 
 export async function PATCH(req: Request) {
   const { id, ...patch } = await req.json()
-  await fetch(`${SUPABASE_URL}/rest/v1/dodavatel_pravidla?id=eq.${id}`, {
+  await fetch(`${SUPABASE_URL}/rest/v1/pravidla?id=eq.${id}`, {
     method: 'PATCH',
     headers: { ...SB, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
     body: JSON.stringify(patch),

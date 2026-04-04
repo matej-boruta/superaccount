@@ -37,7 +37,13 @@ async function getAccessToken(refreshToken: string): Promise<string> {
   return data.access_token
 }
 
-async function listFolderFiles(accessToken: string, folderId: string): Promise<{ id: string; name: string; createdTime: string }[]> {
+type DriveFile = { id: string; name: string; createdTime: string; folderName: string | null }
+
+async function listFolderFiles(
+  accessToken: string,
+  folderId: string,
+  folderName: string | null = null
+): Promise<DriveFile[]> {
   const query = encodeURIComponent(`'${folderId}' in parents and trashed=false`)
   const res = await fetch(
     `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,mimeType,createdTime)&supportsAllDrives=true&includeItemsFromAllDrives=true&pageSize=200`,
@@ -46,16 +52,55 @@ async function listFolderFiles(accessToken: string, folderId: string): Promise<{
   const data = await res.json()
   const items: { id: string; name: string; mimeType: string; createdTime: string }[] = data.files ?? []
 
-  const pdfs = items.filter(f => f.mimeType === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'))
+  const pdfs = items
+    .filter(f => f.mimeType === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'))
+    .map(f => ({ id: f.id, name: f.name, createdTime: f.createdTime, folderName }))
+
   const subfolders = items.filter(f => f.mimeType === 'application/vnd.google-apps.folder')
 
-  // Recurse into subfolders
-  const subFiles = await Promise.all(subfolders.map(sf => listFolderFiles(accessToken, sf.id)))
+  // Recurse — pass THIS subfolder's name down so PDFs inside know which category folder they're in
+  const subFiles = await Promise.all(subfolders.map(sf => listFolderFiles(accessToken, sf.id, sf.name)))
   return [...pdfs, ...subFiles.flat()]
 }
 
-async function listDriveFiles(accessToken: string, folderId: string): Promise<{ id: string; name: string; createdTime: string }[]> {
+async function listDriveFiles(accessToken: string, folderId: string): Promise<DriveFile[]> {
   return listFolderFiles(accessToken, folderId)
+}
+
+/**
+ * Přímá lookup tabulka: suffix za "FaP.XX " → kategorie_id.
+ * Naučeno z reálné struktury Google Drive složek, confidence=100.
+ * Pokrývá CZ i SK varianty; case-insensitive matching přes toLowerCase().
+ */
+const FOLDER_KATEGORIE_MAP: Record<string, number> = {
+  'marketing produkce':        6,  // Marketing/Produkce
+  'marketing produkce sk':     6,
+  'marketing výkon':           5,  // Marketing/Výkon
+  'marketing výkon sk':        5,
+  'personální ceo':            3,  // Personální/CEO
+  'personální zákaznická péče': 1, // Personální/CS
+  'provozní mimořádné':        11, // Provozní/Mimořádné
+  'provozní režie':            10, // Provozní/Režie
+  'it sk':                     7,  // IT/CS
+  'it marketing':              8,  // IT/MKT
+  'it produkt':                9,  // IT/Produkt
+  'it zákaznická péče':        7,  // IT/CS
+  'sab finance':               12, // FX/Směna
+}
+
+/**
+ * Extrahuje suffix za "FaP.XX " a vrátí kategorie_id z přímé tabulky.
+ * Ignoruje parametr kategorie (DB lookup) — tabulka je autoritativní.
+ */
+function matchKategorieByFolderName(
+  folderName: string,
+  _kategorie: { id: number; l1: string; l2: string }[]
+): number | null {
+  // Extrakce suffixu za "FaP.číslo mezera", ořež " - zauctovane" a podobné přípony
+  const match = folderName.match(/FaP\.\d+\s+(.+)$/i)
+  const raw = match ? match[1].trim().toLowerCase() : folderName.toLowerCase()
+  const suffix = raw.replace(/\s*-\s*(zauctovan[eé]|archiv|done|old|backup).*$/i, '').trim()
+  return FOLDER_KATEGORIE_MAP[suffix] ?? null
 }
 
 async function downloadDriveFile(accessToken: string, fileId: string): Promise<Buffer> {
@@ -137,6 +182,13 @@ export async function POST(req: Request) {
   const accessToken = await getAccessToken(tokens[0].refresh_token)
   const files = await listDriveFiles(accessToken, folderId)
 
+  // Načti kategorie jednou pro celý sync — použijeme pro mapování názvů složek
+  const katRes = await fetch(
+    `${SUPABASE_URL}/rest/v1/kategorie?select=id,l1,l2&order=id.asc`,
+    { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+  )
+  const kategorieList: { id: number; l1: string; l2: string }[] = await katRes.json().catch(() => [])
+
   const imported: string[] = []
   const skipped: string[] = []
   const errors: string[] = []
@@ -170,10 +222,16 @@ export async function POST(req: Request) {
 
       const cisloFaktury = String(parsed.cislo_faktury ?? file.name.replace('.pdf', ''))
 
-      // Sekundární deduplikace podle cislo_faktury + dodavatel (různí dodavatelé mohou mít stejné číslo)
+      // Sekundární deduplikace podle cislo_faktury + dodavatel + datum_vystaveni
+      // (různí dodavatelé mohou mít stejné číslo; jeden dodavatel může vystavit dvě faktury stejného čísla v jiném roce)
       const dodavatelParsed = String(parsed.dodavatel ?? '')
+      const datumVystaveniParsed = parsed.datum_vystaveni ? String(parsed.datum_vystaveni) : file.createdTime.split('T')[0]
+      const datumYear = datumVystaveniParsed.slice(0, 4)
       const existByCisloRes = await fetch(
-        `${SUPABASE_URL}/rest/v1/faktury?cislo_faktury=eq.${encodeURIComponent(cisloFaktury)}&dodavatel=eq.${encodeURIComponent(dodavatelParsed)}&select=id&limit=1`,
+        `${SUPABASE_URL}/rest/v1/faktury?cislo_faktury=eq.${encodeURIComponent(cisloFaktury)}` +
+        `&dodavatel=eq.${encodeURIComponent(dodavatelParsed)}` +
+        `&datum_vystaveni=gte.${datumYear}-01-01&datum_vystaveni=lte.${datumYear}-12-31` +
+        `&select=id&limit=1`,
         { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
       )
       const existByCislo = await existByCisloRes.json()
@@ -182,29 +240,48 @@ export async function POST(req: Request) {
         continue
       }
 
-      // Auto-assign kategorie: 1) from ucetni_pravidla, 2) from previous faktura of same supplier
+      // Auto-assign kategorie: 1) folder name, 2) pravidla (unified), 3) history
       let kategorieId: number | null = null
-      const pravidlaRes = await fetch(
-        `${SUPABASE_URL}/rest/v1/ucetni_pravidla?aktivni=eq.true&kategorie_id=not.is.null&dodavatel_pattern=not.is.null&select=dodavatel_pattern,kategorie_id`,
-        { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-      )
-      const pravidla: { dodavatel_pattern: string; kategorie_id: number }[] = await pravidlaRes.json()
-      const dodavatelUpper = dodavatelParsed.toUpperCase()
-      const matchedPravidlo = pravidla.find(p => {
-        const pat = p.dodavatel_pattern.replace(/%/g, '').toUpperCase()
-        return dodavatelUpper.includes(pat)
-      })
-      if (matchedPravidlo) {
-        kategorieId = matchedPravidlo.kategorie_id
-      } else {
-        // Fallback: inherit from last faktura of same dodavatel
-        const prevRes = await fetch(
-          `${SUPABASE_URL}/rest/v1/faktury?dodavatel=eq.${encodeURIComponent(dodavatelParsed)}&kategorie_id=not.is.null&select=kategorie_id&order=id.desc&limit=1`,
+      let katSource = ''
+
+      // 1. Název složky — přímá lookup tabulka (confidence=100)
+      if (file.folderName) {
+        const matched = matchKategorieByFolderName(file.folderName, kategorieList)
+        if (matched) { kategorieId = matched; katSource = `folder:${file.folderName}` }
+      }
+
+      // 2. pravidla — jeden dotaz, seřazeno od nejdelšího patternu (nejspecifičtější)
+      if (!kategorieId) {
+        const pravidlaRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/pravidla?aktivni=eq.true&kategorie_id=not.is.null&dodavatel_pattern=not.is.null&select=dodavatel_pattern,ico,kategorie_id&order=dodavatel_pattern.desc&limit=200`,
           { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
         )
-        const prev = await prevRes.json()
-        if (Array.isArray(prev) && prev.length > 0) kategorieId = prev[0].kategorie_id
+        const pravidla: { dodavatel_pattern: string; ico: string | null; kategorie_id: number }[] = await pravidlaRes.json().catch(() => [])
+        const dodavatelUpper = dodavatelParsed.toUpperCase()
+        const icoFile = parsed.ico ? String(parsed.ico) : null
+        const matched = pravidla.find(p => {
+          if (icoFile && p.ico && p.ico === icoFile) return true
+          const pat = p.dodavatel_pattern.replace(/%/g, '').toUpperCase()
+          return pat && dodavatelUpper.includes(pat)
+        })
+        if (matched) { kategorieId = matched.kategorie_id; katSource = 'pravidla' }
       }
+
+      // 4. Fallback: inherit from last faktura of same dodavatel (ICO first, then name)
+      if (!kategorieId) {
+        const icoFile = parsed.ico ? String(parsed.ico) : null
+        const histField = icoFile
+          ? `ico=eq.${encodeURIComponent(icoFile)}`
+          : `dodavatel=eq.${encodeURIComponent(dodavatelParsed)}`
+        const prevRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/faktury?${histField}&kategorie_id=not.is.null&select=kategorie_id&order=id.desc&limit=1`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+        )
+        const prev = await prevRes.json().catch(() => [])
+        if (Array.isArray(prev) && prev.length > 0) { kategorieId = prev[0].kategorie_id; katSource = 'history' }
+      }
+
+      void katSource // logged implicitly via imported_files
 
       const faktura = {
         cislo_faktury: cisloFaktury,

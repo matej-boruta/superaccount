@@ -11,7 +11,7 @@
  */
 
 import { NextResponse } from 'next/server'
-import { findBestPravidlo, logDecision } from '@/lib/rules'
+import { findBestPravidlo, logDecision, writeFeedback, writeRozhodnuti } from '@/lib/rules'
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
@@ -55,17 +55,36 @@ export async function POST(req: Request) {
       const pravidlo = await findBestPravidlo(dodavatel, ico, 'predkontace')
 
       if (!pravidlo || !pravidlo.kategorie_id) {
-        log.push({ type: 'warn', text: `${dodavatel} — žádné pravidlo, přeskakuji` })
+        log.push({ type: 'warn', text: `${dodavatel} — žádné pravidlo` })
+        // Feedback → Architekt: vytvoř pravidlo
+        await writeFeedback({
+          trigger: 'no_rule',
+          from_agent: 'accountant',
+          to_agent: 'architect',
+          issue: `Nelze kategorizovat dodavatele "${dodavatel}" (ICO: ${ico ?? 'neznámé'}) — žádné pravidlo`,
+          action: 'create_rule',
+          priority: 'medium',
+          context: { faktura_id: fakturaId, dodavatel, ico },
+        })
         continue
       }
 
-      if (pravidlo.confidence < 60) {
-        log.push({ type: 'warn', text: `${dodavatel} — confidence ${pravidlo.confidence}% příliš nízká, eskaluji` })
-        // Nastav NEEDS_INFO
+      if (pravidlo.confidence < 70) {
+        log.push({ type: 'warn', text: `${dodavatel} — confidence ${pravidlo.confidence}% < 70, posílám Auditorovi` })
         await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}`, {
           method: 'PATCH',
           headers: SBW,
-          body: JSON.stringify({ stav_workflow: 'NEEDS_INFO', blocker: `ACCOUNTANT: nízká confidence ${pravidlo.confidence}% pro ${dodavatel}` }),
+          body: JSON.stringify({ stav_workflow: 'NEEDS_INFO', blocker: `ACCOUNTANT: nízká confidence ${pravidlo.confidence}%` }),
+        })
+        // Feedback → Auditor: rozhodni nebo eskaluj
+        await writeFeedback({
+          trigger: 'low_confidence',
+          from_agent: 'accountant',
+          to_agent: 'auditor',
+          issue: `Navrhuji kat ${pravidlo.kategorie_id} pro "${dodavatel}" ale confidence ${pravidlo.confidence}% < 70 — potřebuji validaci`,
+          action: 'fix_case',
+          priority: pravidlo.confidence < 50 ? 'high' : 'medium',
+          context: { faktura_id: fakturaId, dodavatel, ico, navrzena_kategorie: pravidlo.kategorie_id, confidence: pravidlo.confidence },
         })
         continue
       }
@@ -81,16 +100,30 @@ export async function POST(req: Request) {
         }),
       })
 
+      // Zapiš rozhodnutí s pravidlo_id — klíč pro zpětnou analýzu kvality pravidel
+      await writeRozhodnuti({
+        entity_type: 'faktura',
+        entity_id: fakturaId,
+        faktura_id: fakturaId,
+        typ: 'kategorizace',
+        agent: 'accountant',
+        pravidlo_id: pravidlo.id,
+        navrh: { kategorie_id: pravidlo.kategorie_id, md_ucet: pravidlo.md_ucet, dal_ucet: pravidlo.dal_ucet },
+        confidence: pravidlo.confidence,
+        stav: pravidlo.confidence >= 90 ? 'accepted' : pravidlo.confidence >= 70 ? 'proposed' : 'review_required',
+        zdroj: pravidlo.zdroj,
+      })
+
       await logDecision({
         typ: 'rozhodnuti',
+        agent_id: 'accountant',
         faktura_id: fakturaId,
         vstup: { dodavatel, ico, castka: f.castka_s_dph },
         vystup: { kategorie_id: pravidlo.kategorie_id, md_ucet: pravidlo.md_ucet, dal_ucet: pravidlo.dal_ucet },
         confidence: pravidlo.confidence,
         pravidlo_zdroj: `${pravidlo.zdroj_tabulky}#${pravidlo.id}`,
-        // @ts-expect-error rezim not in type but logged
-        rezim: 'ACCOUNTANT',
-        zmena_stavu: 'ACCOUNTING_PROPOSED',
+        to_agent: pravidlo.confidence < 70 ? 'auditor' : undefined,
+        recommended_action: pravidlo.confidence < 70 ? 'validate' : undefined,
       })
 
       log.push({ type: 'action', text: `${dodavatel} → kategorie ${pravidlo.kategorie_id} (conf ${pravidlo.confidence}%)` })

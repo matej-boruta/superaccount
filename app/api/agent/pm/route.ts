@@ -19,6 +19,7 @@
 
 import { NextResponse } from 'next/server'
 import { SYSTEM_PM } from '@/lib/claude'
+import { logDecision as sharedLogDecision } from '@/lib/rules'
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
@@ -97,7 +98,7 @@ async function toolGetCases(year: number) {
       { headers: SB }
     ),
     fetch(
-      `${SUPABASE_URL}/rest/v1/dodavatel_pravidla?select=dodavatel,dodavatel_pattern,kategorie_id,auto_schvalit,auto_parovat`,
+      `${SUPABASE_URL}/rest/v1/pravidla?select=dodavatel,dodavatel_pattern,kategorie_id,auto_schvalit,auto_parovat`,
       { headers: SB }
     ),
     fetch(
@@ -170,19 +171,17 @@ async function logDecision(params: {
   caseId: number; role: string; confidence: number; sourceOfRule: string
   zmenaStavu: string; reason: string
 }) {
-  await fetch(`${SUPABASE_URL}/rest/v1/agent_log`, {
-    method: 'POST',
-    headers: SBW,
-    body: JSON.stringify({
-      typ: 'pm_workflow',
-      faktura_id: params.caseId,
-      rezim: params.role,
-      confidence: params.confidence,
-      source_of_rule: params.sourceOfRule,
-      zmena_stavu: params.zmenaStavu,
-      vystup: params.reason,
-      pravidlo_zdroj: 'pm_agent_v2',
-    }),
+  await sharedLogDecision({
+    typ: 'rozhodnuti',
+    faktura_id: params.caseId,
+    vstup: { role: params.role },
+    vystup: { reason: params.reason },
+    confidence: params.confidence,
+    pravidlo_zdroj: params.sourceOfRule,
+    // @ts-expect-error extended fields not in type
+    rezim: params.role,
+    source_of_rule: params.sourceOfRule,
+    zmena_stavu: params.zmenaStavu,
   })
 }
 
@@ -194,13 +193,17 @@ async function toolAdvanceCase(input: {
 
   // Hard guard: confidence < 60 or amount > 50k should not reach APPROVED via agent
   if (next_state === 'APPROVED' || next_state === 'POSTED') {
-    const fRes = await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${case_id}&select=castka_s_dph`, { headers: SB })
+    const fRes = await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${case_id}&select=castka_s_dph,kategorie_id`, { headers: SB })
     const [f] = await fRes.json()
     if (f && Number(f.castka_s_dph) > 50000) {
       return { ok: false, blocked: true, reason: 'Částka > 50 000 Kč — vyžaduje lidské schválení (ústava §4)' }
     }
     if (confidence < 60) {
       return { ok: false, blocked: true, reason: `Confidence ${confidence} % < 60 % — eskaluj na člověka (ústava §4)` }
+    }
+    // PRAVIDLO: nelze schválit bez kategorie
+    if (next_state === 'APPROVED' && !kategorie_id && !(f?.kategorie_id)) {
+      return { ok: false, blocked: true, reason: 'Faktura nemá kategorii — ACCOUNTANT musí přiřadit kategorii před schválením' }
     }
   }
 

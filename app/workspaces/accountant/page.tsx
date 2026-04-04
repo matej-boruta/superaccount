@@ -1036,6 +1036,7 @@ export default function Home() {
     const seenPatterns = new Set<string>()
     const result: (Pravidlo & { _synthetic?: boolean })[] = []
     for (const p of pravidla) {
+      if (!p.dodavatel_pattern) continue
       const key = p.dodavatel_pattern.toUpperCase()
       if (!seenPatterns.has(key)) { seenPatterns.add(key); result.push(p) }
     }
@@ -1043,6 +1044,7 @@ export default function Home() {
     const uniqueDodavatele = [...new Set(faktury.map(f => f.dodavatel).filter(Boolean))]
     for (const d of uniqueDodavatele) {
       const hasRule = pravidla.some(p => {
+        if (!p.dodavatel_pattern) return false
         const pattern = p.dodavatel_pattern.replace(/%/g, '').toUpperCase()
         return pattern && d.toUpperCase().includes(pattern)
       })

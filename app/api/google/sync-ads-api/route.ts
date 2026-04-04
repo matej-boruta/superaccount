@@ -18,7 +18,7 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY!
 const DEVELOPER_TOKEN = process.env.GOOGLE_ADS_DEVELOPER_TOKEN!
 const CUSTOMER_ID = process.env.GOOGLE_ADS_CUSTOMER_ID || '218298479'
-const DRIVE_FOLDER_ID = '19uD7bGxQTbDLn57L4tpBtH-9bG4lYXl8'
+const DRIVE_FOLDER_ID = '1vCbrmWcLhDR54KVL0EHYaDLg2Qr2RCsM' // ORG.fakturace.ucet 2026 (root)
 
 const SB = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
 const SB_W = { ...SB, 'Content-Type': 'application/json', Prefer: 'return=minimal' }

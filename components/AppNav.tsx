@@ -9,22 +9,7 @@ const nav = [
     items: [
       { href: '/control-tower', label: 'Control Tower', icon: '⬡' },
       { href: '/actions', label: 'Actions', icon: '⚡' },
-    ],
-  },
-  {
-    group: 'Workspaces',
-    items: [
       { href: '/workspaces/accountant', label: 'Faktury', icon: '📒' },
-      { href: '/workspaces/auditor', label: 'Auditor', icon: '🔍' },
-      { href: '/workspaces/ceo', label: 'CEO', icon: '📈' },
-      { href: '/workspaces/assistant', label: 'Asistentka', icon: '📋' },
-    ],
-  },
-  {
-    group: null,
-    items: [
-      { href: '/explorer', label: 'Explorer', icon: '🗂' },
-      { href: '/settings', label: 'Settings', icon: '⚙' },
     ],
   },
 ]

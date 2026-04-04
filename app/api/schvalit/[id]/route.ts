@@ -28,6 +28,14 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
   const [f] = await fRes.json()
   if (!f) return NextResponse.json({ error: 'Faktura nenalezena' }, { status: 404 })
 
+  // PRAVIDLO: faktura bez kategorie nesmí být schválena
+  if (!f.kategorie_id) {
+    return NextResponse.json(
+      { error: 'Faktura nemá přiřazenou kategorii — nelze schválit. Nejprve přiřaď kategorii (ACCOUNTANT).' },
+      { status: 422 }
+    )
+  }
+
   // 2. Compute payment date
   const splatnostRaw = f.datum_splatnosti
   const splatnostYear = splatnostRaw ? parseInt(splatnostRaw.split('-')[0]) : 0
@@ -46,6 +54,7 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
     },
     body: JSON.stringify({
       stav: 'schvalena',
+      stav_workflow: 'APPROVED',
       zauctovano_at: new Date().toISOString(),
       datum_platby: datumPlatbyStr,
     }),

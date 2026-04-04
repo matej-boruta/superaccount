@@ -1,7 +1,7 @@
 /**
  * Detekuje faktury, které pravděpodobně chybí.
  * Zdroj: nesparované odchozí platby — pro každou platbu hledáme, zda existuje faktura.
- * Kontext: dodavatel je identifikován z dodavatel_pravidla nebo historických faktur (zprava match).
+ * Kontext: dodavatel je identifikován z pravidla nebo historických faktur (zprava match).
  * Výstup: jeden řádek na dodavatele — měsíc platby, počet plateb, celková hodnota.
  */
 import { NextResponse } from 'next/server'
@@ -30,7 +30,7 @@ export async function GET(req: Request) {
       { headers: SB }
     ),
     fetch(
-      `${SUPABASE_URL}/rest/v1/dodavatel_pravidla?select=dodavatel,dodavatel_pattern`,
+      `${SUPABASE_URL}/rest/v1/pravidla?select=dodavatel,dodavatel_pattern`,
       { headers: SB }
     ),
   ])

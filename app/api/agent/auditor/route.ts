@@ -12,7 +12,7 @@
  */
 
 import { NextResponse } from 'next/server'
-import { logDecision } from '@/lib/rules'
+import { logDecision, findBestPravidlo, writeFeedback } from '@/lib/rules'
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
@@ -72,6 +72,19 @@ export async function POST(req: Request) {
       flagged++
     }
     if (lowConfLogs.length > 10) log.push({ type: 'warn', text: `… a dalších ${lowConfLogs.length - 10}` })
+
+    // Feedback → Architekt: příliš mnoho nízkých confidence = slabá pravidla
+    if (lowConfLogs.length > 5) {
+      await writeFeedback({
+        trigger: 'high_low_confidence_rate',
+        from_agent: 'auditor',
+        to_agent: 'architect',
+        issue: `${lowConfLogs.length} rozhodnutí s confidence < 60% — pravidla jsou příliš slabá nebo chybí`,
+        action: 'update_rule',
+        priority: lowConfLogs.length > 20 ? 'high' : 'medium',
+        context: { low_conf_count: lowConfLogs.length, sample_faktura_ids: lowConfLogs.slice(0, 5).map(l => l.faktura_id) },
+      })
+    }
   } else {
     log.push({ type: 'action', text: 'Žádná rozhodnutí s nízkou confidence.' })
   }
@@ -98,6 +111,16 @@ export async function POST(req: Request) {
         })
         flagged++
       }
+      // Feedback → Architekt: broken pipeline
+      await writeFeedback({
+        trigger: 'approved_without_category',
+        from_agent: 'auditor',
+        to_agent: 'architect',
+        issue: `${withoutKat.length} faktur prošlo schválením bez kategorie — pipeline je přerušena`,
+        action: 'fix_case',
+        priority: 'high',
+        context: { count: withoutKat.length, ids: withoutKat.map(f => f.id) },
+      })
     } else {
       log.push({ type: 'action', text: `${accountingProposed.length} ACCOUNTING_PROPOSED → kategorie OK, posuvám do AUDIT_CHECKED` })
       for (const f of accountingProposed) {
@@ -111,16 +134,84 @@ export async function POST(req: Request) {
     }
   }
 
+  // ── 4. Kontrola kategorií — faktury bez kategorie vs. pravidla ──────────────
+  const bezKatRes = await fetch(
+    `${SUPABASE_URL}/rest/v1/faktury` +
+    `?stav=in.(nova,schvalena)` +
+    `&datum_vystaveni=gte.${year}-01-01` +
+    `&kategorie_id=is.null` +
+    `&select=id,dodavatel,ico,castka_s_dph,mena,stav_workflow`,
+    { headers: { ...SB, Range: '0-9999' } }
+  )
+  const bezKatFaktury: Record<string, unknown>[] = await bezKatRes.json().catch(() => [])
+
+  let autoAssigned = 0
+  let noRule = 0
+
+  if (Array.isArray(bezKatFaktury) && bezKatFaktury.length > 0) {
+    log.push({ type: 'info', text: `Kontrola kategorií: ${bezKatFaktury.length} faktur bez kategorie` })
+
+    for (const f of bezKatFaktury) {
+      const dodavatel = String(f.dodavatel ?? '')
+      const ico = f.ico ? String(f.ico) : null
+
+      // 1. Zkus pravidlo (pravidla → pravidla → ucetni_vzory)
+      const pravidlo = await findBestPravidlo(dodavatel, ico, 'predkontace')
+
+      if (pravidlo?.kategorie_id && pravidlo.confidence >= 60) {
+        await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${f.id}`, {
+          method: 'PATCH',
+          headers: SBW,
+          body: JSON.stringify({
+            kategorie_id: pravidlo.kategorie_id,
+            stav_workflow: 'ACCOUNTING_PROPOSED',
+          }),
+        })
+        log.push({ type: 'action', text: `${dodavatel} → kat ${pravidlo.kategorie_id} z ${pravidlo.zdroj} (${pravidlo.confidence}%)` })
+        autoAssigned++
+        approved++
+        continue
+      }
+
+      // 2. Fallback: hledej v historii faktur stejného dodavatele
+      if (f.ico || dodavatel) {
+        const histField = f.ico ? `ico=eq.${encodeURIComponent(String(f.ico))}` : `dodavatel=eq.${encodeURIComponent(dodavatel)}`
+        const histRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/faktury?${histField}&kategorie_id=not.is.null&id=neq.${f.id}&select=kategorie_id&order=id.desc&limit=1`,
+          { headers: SB }
+        )
+        const [prev] = await histRes.json().catch(() => [])
+        if (prev?.kategorie_id) {
+          await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${f.id}`, {
+            method: 'PATCH',
+            headers: SBW,
+            body: JSON.stringify({ kategorie_id: prev.kategorie_id, stav_workflow: 'ACCOUNTING_PROPOSED' }),
+          })
+          log.push({ type: 'action', text: `${dodavatel} → kat ${prev.kategorie_id} z history (65%)` })
+          autoAssigned++
+          approved++
+          continue
+        }
+      }
+
+      log.push({ type: 'warn', text: `${dodavatel} — žádné pravidlo ani historie, eskaluji` })
+      noRule++
+    }
+
+    log.push({ type: autoAssigned > 0 ? 'action' : 'info', text: `Kontrola kategorií: ${autoAssigned} přiřazeno, ${noRule} bez pravidla` })
+  }
+
   // Log AUDITOR rozhodnutí
   await logDecision({
-    typ: flagged > 0 ? 'korekce' : 'rozhodnuti',
+    typ: flagged > 0 ? 'korekce' : 'validace',
+    agent_id: 'auditor',
     vstup: { task, low_conf_count: lowConfLogs.length, needs_info_count: needsInfoFaktury.length },
     vystup: { flagged, approved, accounting_proposed: accountingProposed.length },
     confidence: flagged > 0 ? 50 : 90,
     pravidlo_zdroj: 'auditor_sweep',
-    // @ts-expect-error rezim not in type
-    rezim: 'AUDITOR',
-    zmena_stavu: flagged > 0 ? 'AUDIT_FLAGGED' : 'AUDIT_CHECKED',
+    to_agent: flagged > 0 ? 'architect' : undefined,
+    recommended_action: flagged > 0 ? 'review_flagged' : undefined,
+    create_task: flagged > 5,
   })
 
   const summary = `AUDITOR: ${approved} schváleno, ${flagged} označeno/vráceno. ${lowConfLogs.length} nízkých confidence.`
