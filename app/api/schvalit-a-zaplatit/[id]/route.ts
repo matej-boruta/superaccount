@@ -123,9 +123,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     kategorieId = await classifyWithAI(f, kategorieList)
   }
 
-  // Pokud uživatel explicitně změnil kategorii → ulož jako pravidlo (učení)
+  // Učení ze schválení
   const autoKategorieId = pravidlo?.kategorie_id ?? f.kategorie_id ?? null
+
   if (bodyKategorieId && bodyKategorieId !== autoKategorieId && f.dodavatel) {
+    // KOREKCE — uživatel změnil kategorii → nové pravidlo s conf 95
     await savePravidlo({
       typ: 'predkontace',
       dodavatel: f.dodavatel,
@@ -143,6 +145,25 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       pravidlo_zdroj: 'manual',
       faktura_id: Number(id),
     })
+  } else if (pravidlo?.id && (!bodyKategorieId || bodyKategorieId === autoKategorieId)) {
+    // TICHÉ POTVRZENÍ — schváleno bez změny kategorie → posil confidence pravidla o 2 (max 95)
+    ;(async () => {
+      try {
+        const newConf = Math.min(95, pravidlo.confidence + 2)
+        if (newConf > pravidlo.confidence) {
+          await fetch(`${SUPABASE_URL}/rest/v1/pravidla?id=eq.${pravidlo.id}`, {
+            method: 'PATCH',
+            headers: {
+              apikey: SUPABASE_KEY,
+              Authorization: `Bearer ${SUPABASE_KEY}`,
+              'Content-Type': 'application/json',
+              Prefer: 'return=minimal',
+            },
+            body: JSON.stringify({ confidence: newConf }),
+          })
+        }
+      } catch { /* non-blocking */ }
+    })()
   }
 
   const kategorie = Array.isArray(kategorieList)
