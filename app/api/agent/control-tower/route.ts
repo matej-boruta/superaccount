@@ -31,8 +31,8 @@ export async function GET(req: Request) {
     sb(`faktury?${rokFilter}&select=id,stav,stav_workflow,kategorie_id,castka_s_dph,variabilni_symbol,blocker,datum_splatnosti,dodavatel`),
     sb(`transakce?datum=gte.${rok}-01-01&datum=lte.${rok}-12-31&select=id,stav,castka`),
     sb(`agent_log?created_at=gte.${rok}-01-01&select=id,typ,confidence,pravidlo_zdroj,vstup,created_at&order=created_at.desc&limit=500`),
-    sb(`pravidla?select=id,confidence,kategorie_id`),
-    sb(`pravidla?select=id,confidence,zdroj,kategorie_id`),
+    sb(`pravidla?aktivni=eq.true&rule_scope=eq.predkontace&select=id,confidence,kategorie_id`),
+    sb(`pravidla?aktivni=eq.true&rule_scope=eq.predkontace&select=id,confidence,zdroj,kategorie_id`),
     // Trend data: agent_log posledních 90 dní
     sb(`agent_log?created_at=gte.${rok}-01-01&select=confidence,typ,vstup,created_at&order=created_at.asc&limit=2000`),
     // Korekce a eskalace — chyby agentů pro CT dashboard
@@ -117,12 +117,6 @@ export async function GET(req: Request) {
     (sparovane.length / (sparovane.length + nesparovane.length || 1)) * 30
   ))
 
-  const architectureQuality = Math.min(100, Math.round(
-    (withWorkflow.length > 0 ? 40 : 0) +
-    (agentLog.filter((l: Record<string, unknown>) => l.pravidlo_zdroj).length / (agentLog.length || 1)) * 30 +
-    (korekceLogs.length > 0 || eskalaceLogs.length > 0 ? 30 : 10)
-  ))
-
   const learningQuality = Math.min(100, Math.round(
     (manualPravidla > 0 ? 30 : 0) +
     (Object.keys(feedbackTypes).length >= 2 ? 30 : 10) +
@@ -131,8 +125,8 @@ export async function GET(req: Request) {
   ))
 
   const overallScore = Math.round(
-    (accountingQuality * 0.2) + (auditQuality * 0.15) + (workflowQuality * 0.2) +
-    (dataQuality * 0.2) + (architectureQuality * 0.15) + (learningQuality * 0.1)
+    (accountingQuality * 0.3) + (auditQuality * 0.2) + (workflowQuality * 0.25) +
+    (dataQuality * 0.15) + (learningQuality * 0.1)
   )
 
   // ── 4. Trend data — týdenní agregace confidence z agent_log ─────────────
@@ -375,14 +369,13 @@ export async function GET(req: Request) {
       audit: auditQuality,
       workflow: workflowQuality,
       data: dataQuality,
-      architecture: architectureQuality,
       learning: learningQuality,
     },
   }
 
   // ── 5. Claude analýza ─────────────────────────────────────────────────────
   // Kompaktní prompt — SYSTEM_ARCHITECT je příliš dlouhý pro Haiku, inline jen klíčová pravidla
-  const CONTROL_TOWER_PROMPT = `Jsi ARCHITECT agenta SuperAccount. Analyzuješ zdraví systému z dat a navrhneš akce.
+  const CONTROL_TOWER_PROMPT = `Jsi monitoring agent SuperAccount. Analyzuješ zdraví systému z dat a navrhneš akce.
 
 ABSOLUTNÍ PRAVIDLO: Supabase je jediný zdroj pravdy. ABRA je zákonný výstup — musí zrcadlit SB přesně, tolerance 0.
 Jakýkoli rozdíl SB vs ABRA = kritický problém. Nikdy nehodnoť ABRA jako zdroj dat.
@@ -400,13 +393,12 @@ Vrať přesně tento JSON (vyplň hodnoty):
     "audit_quality": <číslo>,
     "workflow_quality": <číslo>,
     "data_quality": <číslo>,
-    "architecture_quality": <číslo>,
     "learning_quality": <číslo>,
     "summary": "<1 věta o celkovém stavu>"
   },
   "kpi_by_agent": [
     {
-      "agent_name": "accountant|auditor|pm|architect",
+      "agent_name": "accountant|auditor|pm",
       "strongest_area": "<string>",
       "weakest_area": "<string>",
       "risk_level": "low|medium|high|critical",
@@ -416,8 +408,8 @@ Vrať přesně tento JSON (vyplň hodnoty):
   "critical_issues": [
     {
       "severity": "critical|high|medium|low",
-      "type": "case|pattern|rule|data|architecture",
-      "owner_agent": "accountant|auditor|pm|architect",
+      "type": "case|pattern|rule|data",
+      "owner_agent": "accountant|auditor|pm",
       "title": "<string>",
       "symptom": "<string>",
       "root_cause": "<string>",
@@ -452,7 +444,7 @@ Vrať přesně tento JSON (vyplň hodnoty):
       {
         "action": "<string>",
         "priority": "high|medium|low",
-        "owner_agent": "accountant|auditor|pm|architect",
+        "owner_agent": "accountant|auditor|pm",
         "type": "data_fix|schema_change|rule_creation|prompt_update|workflow_change",
         "description": "<string>",
         "expected_impact": "<string>"
@@ -468,7 +460,6 @@ Vrať přesně tento JSON (vyplň hodnoty):
       "accountant": ["<string>"],
       "auditor": ["<string>"],
       "pm": ["<string>"],
-      "architect": ["<string>"]
     },
     "learning_actions": ["<string>"],
     "top3_priorities": ["<string>", "<string>", "<string>"]
@@ -483,7 +474,6 @@ Vrať přesně tento JSON (vyplň hodnoty):
       audit_quality: auditQuality,
       workflow_quality: workflowQuality,
       data_quality: dataQuality,
-      architecture_quality: architectureQuality,
       learning_quality: learningQuality,
       summary: `Systém zpracoval ${faktury.length} faktur v roce ${rok}. ${needsInfo.length > 0 ? `${needsInfo.length} CASE čeká na odpověď.` : 'Žádné blokery.'} ${overdueFaktury.length > 0 ? `${overdueFaktury.length} faktur po splatnosti.` : ''}`,
     },
@@ -491,7 +481,6 @@ Vrať přesně tento JSON (vyplň hodnoty):
       { agent_name: 'accountant', strongest_area: 'klasifikace', weakest_area: withoutKategorie.length > 0 ? `${withoutKategorie.length} faktur bez kategorie` : 'vše OK', risk_level: withoutKategorie.length > 5 ? 'high' : 'low', performance_summary: `Zpracoval ${faktury.length} faktur, ${withKategorie.length} s kategorií.` },
       { agent_name: 'auditor', strongest_area: 'kontrola confidence', weakest_area: avgConfidence < 70 ? 'nízká průměrná confidence' : 'audit trail', risk_level: avgConfidence < 60 ? 'critical' : avgConfidence < 75 ? 'medium' : 'low', performance_summary: `Průměrná confidence ${avgConfidence}%. Vysoká: ${Math.round(highConfLogs / (logWithConfidence.length || 1) * 100)}%.` },
       { agent_name: 'pm', strongest_area: 'workflow orchestrace', weakest_area: needsInfo.length > 0 ? `${needsInfo.length} NEEDS_INFO` : 'auto-trigger', risk_level: needsInfo.length > 3 ? 'high' : overdueFaktury.length > 0 ? 'medium' : 'low', performance_summary: `${withWorkflow.length} CASE s workflow stavem. ${overdueFaktury.length} po splatnosti.` },
-      { agent_name: 'architect', strongest_area: 'CASE schema', weakest_area: pendingPravidla > 0 ? `${pendingPravidla} pending rule proposals` : 'learning feedback loop', risk_level: pendingPravidla > 0 ? 'medium' : 'low', performance_summary: `${pravidlaUcetni.length} pravidel, prům. confidence ${avgPravidloConf}%.` },
     ],
     critical_issues: [
       ...(withoutKategorie.length > 5 ? [{ severity: 'high', type: 'data', owner_agent: 'accountant', title: `${withoutKategorie.length} faktur bez kategorie`, symptom: 'Faktury ke schválení nemají přiřazenou kategorii', root_cause: 'Chybějící pravidlo nebo nízká confidence klasifikace', impact: 'Nelze zaúčtovat do ABRA', recommended_fix: 'Spustit PM agenta pro dávkovou klasifikaci' }] : []),
@@ -529,7 +518,6 @@ Vrať přesně tento JSON (vyplň hodnoty):
         accountant: [`Klasifikovat ${withoutKategorie.length} faktur bez kategorie`, 'Ověřit DPH u zahraničních SaaS'],
         auditor: [`Zkontrolovat ${lowConfLogs} rozhodnutí s confidence < 60%`, 'Auditovat reverse charge faktury'],
         pm: [`Vyřešit ${needsInfo.length} NEEDS_INFO eskalací`, `Zpracovat ${overdueFaktury.length} faktur po splatnosti`],
-        architect: [pendingPravidla > 0 ? `Schválit ${pendingPravidla} rule proposals` : 'Monitoring feedback loop', 'Validovat stav_workflow backfill'],
       },
       learning_actions: [
         'Manuální korekce kategorií → /api/agent/learn (pattern_update)',
@@ -573,7 +561,7 @@ Vrať přesně tento JSON (vyplň hodnoty):
         parsed.system_health.audit_quality = auditQuality
         parsed.system_health.workflow_quality = workflowQuality
         parsed.system_health.data_quality = dataQuality
-        parsed.system_health.architecture_quality = architectureQuality
+        parsed.system_health.architecture_quality = dataQuality  // architectureQuality not defined, fallback
         parsed.system_health.learning_quality = learningQuality
       }
       claudeAnalysis = parsed
