@@ -1,4 +1,8 @@
 {
+  "functions": {
+    "app/api/auto-parovani/route.ts": { "maxDuration": 300 },
+    "app/api/agent/cron/route.ts": { "maxDuration": 300 }
+  },
   "crons": [
     {
       "path": "/api/agent/cron",
