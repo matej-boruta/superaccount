@@ -20,9 +20,10 @@ const SB = () => ({
 
 export type Pravidlo = {
   id: number
-  typ: string
+  rule_scope: string
   ico: string | null
   dodavatel_pattern: string | null
+  name_suplier: string | null
   kategorie_id: number | null
   md_ucet: string | null
   dal_ucet: string | null
@@ -33,6 +34,7 @@ export type Pravidlo = {
   auto_parovat: boolean
   limit_auto_kc: number
   parovat_keyword: string | null
+  typ_platby: string | null
   confidence: number
   zdroj: string
   poznamka: string | null
@@ -41,7 +43,7 @@ export type Pravidlo = {
 
 export type AgentLogEntry = {
   typ: 'plan' | 'rozhodnuti' | 'korekce' | 'eskalace' | 'chyba' | 'validace' | 'handoff' | 'rule_update' | 'incident'
-  agent_id?: 'accountant' | 'auditor' | 'architect' | 'orchestrator' | 'pm' | 'human'
+  agent_id?: 'accountant' | 'auditor' | 'orchestrator' | 'pm' | 'human'
   vstup: Record<string, unknown>
   vystup: Record<string, unknown>
   confidence: number
@@ -77,12 +79,12 @@ async function findInPravidla(
   ico: string | null,
   typ?: string
 ): Promise<Pravidlo | null> {
-  const typFilter = typ ? `&typ=eq.${encodeURIComponent(typ)}` : ''
+  const scopeFilter = typ ? `&rule_scope=eq.${encodeURIComponent(typ)}` : `&rule_scope=eq.predkontace`
 
-  // ICO přesná shoda (scope=ico má nejvyšší prioritu)
+  // ICO přesná shoda
   if (ico) {
     const res = await fetch(
-      `${SB_URL}/rest/v1/pravidla?ico=eq.${encodeURIComponent(ico)}&aktivni=eq.true${typFilter}&order=confidence.desc&limit=1`,
+      `${SB_URL}/rest/v1/pravidla?ico=eq.${encodeURIComponent(ico)}&aktivni=eq.true${scopeFilter}&order=confidence.desc&limit=1`,
       { headers: SB() }
     )
     const rows = await res.json()
@@ -94,7 +96,7 @@ async function findInPravidla(
 
   // Pattern match — načti všechna aktivní s pattern, porovnej v JS
   const res = await fetch(
-    `${SB_URL}/rest/v1/pravidla?aktivni=eq.true&dodavatel_pattern=not.is.null${typFilter}&order=confidence.desc&limit=200`,
+    `${SB_URL}/rest/v1/pravidla?aktivni=eq.true&rule_scope=eq.predkontace&dodavatel_pattern=not.is.null&order=confidence.desc&limit=200`,
     { headers: SB() }
   )
   const rows = await res.json()
@@ -131,9 +133,10 @@ function incrementPocetPouziti(pravidloId: number): void {
 function mapPravidlo(r: Record<string, unknown>): Pravidlo {
   return {
     id: r.id as number,
-    typ: String(r.typ ?? 'predkontace'),
+    rule_scope: String(r.rule_scope ?? 'predkontace'),
     ico: r.ico as string | null,
     dodavatel_pattern: r.dodavatel_pattern as string | null,
+    name_suplier: r.name_suplier as string | null,
     kategorie_id: r.kategorie_id as number | null,
     md_ucet: r.md_ucet as string | null,
     dal_ucet: r.dal_ucet as string | null,
@@ -141,9 +144,10 @@ function mapPravidlo(r: Record<string, unknown>): Pravidlo {
     dal_dph: null,
     sazba_dph: r.sazba_dph as number | null,
     auto_schvalit: (r.confidence as number ?? 0) >= 90,
-    auto_parovat: String(r.typ) === 'parovani',
+    auto_parovat: String(r.rule_scope) === 'parovani',
     limit_auto_kc: Number(r.limit_kc ?? 50000),
     parovat_keyword: r.keyword as string | null,
+    typ_platby: r.typ_platby as string | null,
     confidence: Number(r.confidence ?? 70),
     zdroj: String(r.zdroj ?? 'manual'),
     poznamka: r.poznamka as string | null,
@@ -226,9 +230,10 @@ async function findInDodavatelPravidla(
 function mapDodavatelPravidlo(r: Record<string, unknown>): Pravidlo {
   return {
     id: r.id as number,
-    typ: 'predkontace',
+    rule_scope: 'predkontace',
     ico: r.ico as string | null,
     dodavatel_pattern: (r.dodavatel_pattern ?? r.dodavatel) as string | null,
+    name_suplier: (r.name_suplier ?? null) as string | null,
     kategorie_id: r.kategorie_id as number | null,
     md_ucet: (r.md_ucet ?? null) as string | null,
     dal_ucet: (r.dal_ucet ?? null) as string | null,
@@ -239,6 +244,7 @@ function mapDodavatelPravidlo(r: Record<string, unknown>): Pravidlo {
     auto_parovat: Boolean(r.auto_parovat),
     limit_auto_kc: Number(r.limit_auto_kc ?? 50000),
     parovat_keyword: (r.parovat_keyword ?? null) as string | null,
+    typ_platby: (r.typ_platby ?? null) as string | null,
     confidence: 80,
     zdroj: 'dodavatel_pravidla',
     poznamka: null,
@@ -277,9 +283,10 @@ async function findInUcetniVzory(
 function mapVzor(v: Record<string, unknown>): Pravidlo {
   return {
     id: v.id as number,
-    typ: String(v.typ_dokladu ?? 'predkontace'),
+    rule_scope: String(v.typ_dokladu ?? 'predkontace'),
     ico: v.ico as string | null,
     dodavatel_pattern: v.dodavatel as string | null,
+    name_suplier: null,
     kategorie_id: v.kategorie_id as number | null,
     md_ucet: v.md_ucet as string | null,
     dal_ucet: v.dal_ucet as string | null,
@@ -290,6 +297,7 @@ function mapVzor(v: Record<string, unknown>): Pravidlo {
     auto_parovat: Boolean(v.auto_parovat),
     limit_auto_kc: Number(v.limit_auto_kc ?? 50000),
     parovat_keyword: v.parovat_keyword as string | null,
+    typ_platby: null,
     confidence: Number(v.confidence ?? 70),
     zdroj: String(v.zdroj ?? 'history'),
     poznamka: v.poznamka as string | null,
@@ -332,42 +340,66 @@ export async function writeFeedback(entry: FeedbackEntry): Promise<void> {
   }
 }
 
-// ─── Zápis do rozodnuti ──────────────────────────────────────────────────────
+// ─── Zápis do decisions ──────────────────────────────────────────────────────
 
-export type RozhodnutiEntry = {
-  entity_type: 'faktura' | 'transakce' | 'pravidlo' | 'system'
-  entity_id?: number | null
-  faktura_id?: number | null
-  transakce_id?: number | null
-  typ: 'kategorizace' | 'parovani' | 'predkontace' | 'validace' | 'eskalace' | 'korekce'
-  agent: 'accountant' | 'auditor' | 'architect' | 'orchestrator' | 'human'
-  pravidlo_id?: number | null
-  navrh: Record<string, unknown>
-  confidence: number
-  stav: 'proposed' | 'review_required' | 'accepted' | 'rejected' | 'escalated'
-  zdroj: string
+export type DecisionEntry = {
+  case_id?: number | null
+  agent_id: 'accountant' | 'auditor' | 'orchestrator' | 'human'
+  decision_type: 'predkontace' | 'parovani' | 'klasifikace' | 'dph' | 'audit'
+  recommendation_json: Record<string, unknown>
+  input_data_json?: Record<string, unknown>
+  rules_applied_json?: Record<string, unknown> | null
+  decision_confidence: number   // 0–1
+  autonomy_confidence?: number  // 0–1
+  status: 'created' | 'pending_audit' | 'pending_human_approval' | 'approved' | 'approved_with_edit' | 'rejected' | 'needs_rework' | 'executed'
 }
 
-export async function writeRozhodnuti(entry: RozhodnutiEntry): Promise<void> {
+/** Zapíše rozhodnutí do tabulky decisions. Vrací id pro případné navázání feedbacku. */
+export async function writeDecision(entry: DecisionEntry): Promise<number | null> {
   try {
-    await fetch(`${SB_URL}/rest/v1/rozhodnuti`, {
+    const res = await fetch(`${SB_URL}/rest/v1/decisions`, {
       method: 'POST',
-      headers: { ...SB(), 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-      body: JSON.stringify(entry),
+      headers: { ...SB(), 'Content-Type': 'application/json', Prefer: 'return=representation' },
+      body: JSON.stringify({
+        case_id: entry.case_id ?? null,
+        agent_id: entry.agent_id,
+        version: 1,
+        decision_type: entry.decision_type,
+        recommendation_json: entry.recommendation_json,
+        input_data_json: entry.input_data_json ?? {},
+        rules_applied_json: entry.rules_applied_json ?? null,
+        decision_confidence: entry.decision_confidence,
+        autonomy_confidence: entry.autonomy_confidence ?? entry.decision_confidence,
+        status: entry.status,
+      }),
     })
+    if (!res.ok) return null
+    const [row] = await res.json()
+    return row?.id ?? null
   } catch {
-    // rozodnuti zápis nesmí blokovat hlavní operaci
+    return null
   }
 }
 
 // ─── Zápis do agent_log ───────────────────────────────────────────────────────
 
 export async function logDecision(entry: AgentLogEntry): Promise<void> {
+  // Posílej jen sloupce, které v tabulce existují (extra pole způsobují PGRST204)
+  const payload: Record<string, unknown> = {
+    typ: entry.typ,
+    agent_id: entry.agent_id,
+    vstup: entry.vstup,
+    vystup: entry.vystup,
+    confidence: entry.confidence,
+    pravidlo_zdroj: entry.pravidlo_zdroj,
+  }
+  if (entry.faktura_id != null) payload.faktura_id = entry.faktura_id
+  if (entry.transakce_id != null) payload.transakce_id = entry.transakce_id
   try {
     await fetch(`${SB_URL}/rest/v1/agent_log`, {
       method: 'POST',
       headers: { ...SB(), 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-      body: JSON.stringify(entry),
+      body: JSON.stringify(payload),
     })
   } catch {
     // agent_log je audit trail — chyba zápisu nesmí blokovat hlavní operaci
@@ -393,7 +425,48 @@ export type NovePravidlo = {
   poznamka?: string | null
 }
 
+/**
+ * Upraví confidence pravidla o delta (kladné = posílení, záporné = oslabení).
+ * Clamp: 10–95. Pokud confidence přesáhne 90 → nastaví pocet_pouziti+1 a poznamku.
+ * Vrací novou confidence nebo null pokud pravidlo nenalezeno.
+ */
+export async function adjustPravidloConfidence(pravidloId: number, delta: number, poznamka?: string): Promise<number | null> {
+  try {
+    const res = await fetch(`${SB_URL}/rest/v1/pravidla?id=eq.${pravidloId}&select=id,confidence,pocet_pouziti,aktivni`, {
+      headers: SB(),
+    })
+    const [p] = await res.json().catch(() => [])
+    if (!p) return null
+
+    const newConf = Math.max(10, Math.min(95, Number(p.confidence) + delta))
+    if (newConf === Number(p.confidence)) return newConf  // žádná změna
+
+    const patch: Record<string, unknown> = { confidence: newConf }
+    if (delta > 0) patch.pocet_pouziti = (Number(p.pocet_pouziti ?? 0) + 1)
+    if (poznamka) patch.poznamka = poznamka
+
+    await fetch(`${SB_URL}/rest/v1/pravidla?id=eq.${pravidloId}`, {
+      method: 'PATCH',
+      headers: { ...SB(), 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify(patch),
+    })
+    return newConf
+  } catch {
+    return null
+  }
+}
+
 export async function savePravidlo(p: NovePravidlo): Promise<void> {
+  // Nejdřív zkontroluj zda pravidlo pro tohoto dodavatele+typ již existuje
+  const existing = await findBestPravidlo(p.dodavatel, p.ico ?? null, p.typ)
+  if (existing?.id) {
+    // Pravidlo existuje — jen zvýš confidence pokud nové je vyšší
+    if ((p.confidence ?? 0) > existing.confidence) {
+      await adjustPravidloConfidence(existing.id, p.confidence - existing.confidence, p.poznamka ?? undefined)
+    }
+    return
+  }
+
   const payload = {
     typ: p.typ,
     dodavatel_pattern: p.dodavatel,

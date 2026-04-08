@@ -62,7 +62,7 @@ function fmtDate(d: string | null | undefined) {
   return date.toLocaleDateString('cs-CZ', { day: 'numeric', month: 'short', year: 'numeric' })
 }
 
-type Tab = 'nova' | 'schvalena' | 'zaplacena' | 'zamitnuta' | 'vse' | 'sparovane' | 'nesparovane' | 'vydane' | 'vykazy' | 'abra'
+type Tab = 'nova' | 'schvalena' | 'zaplacena' | 'zamitnuta' | 'vse' | 'sparovane' | 'nesparovane' | 'vydane' | 'abra'
 
 type Pravidlo = {
   id: number
@@ -73,6 +73,29 @@ type Pravidlo = {
   auto_parovat: boolean
   poznamka: string | null
   kategorie_id: number | null
+  confidence: number | null
+  rule_scope: string | null
+  keyword: string | null
+  name_suplier: string | null
+  mena: string | null
+}
+
+// { pattern: 'google', keywords: ['google ads', 'google cloud', ...], mena: 'EUR' }
+type SupplierKwRule = { pattern: string; keywords: string[]; mena: string | null }
+
+function buildSupplierKeywords(pravidla: Pravidlo[]): SupplierKwRule[] {
+  const map = new Map<string, { keywords: string[]; mena: string | null }>()
+  for (const p of pravidla) {
+    if (!p.keyword) continue
+    // Derive match key: prefer dodavatel_pattern, fallback to first word of name_suplier
+    const patternRaw = (p.dodavatel_pattern ?? '').replace(/%/g, '').trim()
+    const pattern = (patternRaw || (p.name_suplier ?? '').split(/[\s,.(]/)[0].trim()).toLowerCase()
+    if (!pattern) continue
+    const entry = map.get(pattern) ?? { keywords: [], mena: p.mena ?? null }
+    entry.keywords.push(p.keyword.toLowerCase())
+    map.set(pattern, entry)
+  }
+  return Array.from(map.entries()).map(([pattern, { keywords, mena }]) => ({ pattern, keywords, mena }))
 }
 
 type FakturaVydana = {
@@ -100,7 +123,6 @@ const TABS = [
   { key: 'sparovane' as Tab, label: 'Spárované' },
   { key: 'nesparovane' as Tab, label: 'Nespárované' },
   { key: 'vydane' as Tab, label: 'Vydané faktury' },
-  { key: 'vykazy' as Tab, label: 'Výkazy' },
   { key: 'abra' as Tab, label: 'ABRA check' },
 ]
 
@@ -118,42 +140,124 @@ function dayLabel(d: string): string | null {
 
 type MatchCandidate = { t: Transakce; score: number; reasons: string[] }
 
-// Klíčová slova známých dodavatelů pro detekci konfliktů v popisu kart. transakcí
-const KNOWN_SUPPLIER_KEYWORDS: Record<string, string[]> = {
-  'google': ['google ads', 'google *ads', 'google cloud', 'google workspace', 'google ireland'],
-  'seznam': ['seznam', 'sklik'],
-  'facebook': ['facebook', 'meta '],
-  'twilio': ['twilio'],
-  'daktela': ['daktela'],
-  'ipex': ['ipex'],
-  'freepik': ['freepik'],
+// Fallback supplier keywords pokud pravidla z DB nejsou ještě načtena
+const FALLBACK_SUPPLIER_KEYWORDS: SupplierKwRule[] = [
+  { pattern: 'google', keywords: ['google ads', 'google *ads', 'google cloud', 'google workspace', 'google ireland'], mena: 'EUR' },
+  { pattern: 'seznam', keywords: ['seznam', 'sklik'], mena: 'CZK' },
+  { pattern: 'meta', keywords: ['facebk', 'facebook', 'meta ads'], mena: 'EUR' },
+  { pattern: 'twilio', keywords: ['twilio'], mena: 'USD' },
+  { pattern: 'stape', keywords: ['stape'], mena: 'USD' },
+  { pattern: 'daktela', keywords: ['daktela'], mena: 'CZK' },
+  { pattern: 'openai', keywords: ['openai', 'chatgpt'], mena: 'USD' },
+  { pattern: 'ipex', keywords: ['ipex'], mena: 'CZK' },
+  { pattern: 'freepik', keywords: ['freepik'], mena: 'EUR' },
+]
+
+// Max skóre pro normalizaci: VS(50)+částka(40)+účet(35)+datum(30)+název(15)+text(20) = 190
+// Pro kart. dodavatele s keyword: (cardScore/70)*190, max 70 = 100% confidence
+const SCORE_MAX = 190
+
+function scoreToConfidence(score: number): number {
+  return Math.min(99, Math.max(1, Math.round((score / SCORE_MAX) * 100)))
 }
 
-function scoreCandidate(faktura: Faktura, t: Transakce): MatchCandidate {
+function textTokens(s: string): Set<string> {
+  return new Set((s ?? '').toLowerCase().split(/\W+/).filter(w => w.length >= 4))
+}
+
+function scoreCandidate(
+  faktura: Faktura,
+  t: Transakce,
+  knownProtiucty?: Set<string>,
+  knownZpravy?: string[],
+  supplierKeywords?: SupplierKwRule[],
+): MatchCandidate {
   let score = 0
   const reasons: string[] = []
-  const amtDiff = Math.abs(Math.abs(t.castka) - faktura.castka_s_dph) / (faktura.castka_s_dph || 1)
+
+  // Porovnání částek — řeší cizí měnu
+  // Pro non-CZK faktury: 1) hledáme fxAmount v popisu platby (např. "částka  44.95 USD")
+  //                       2) fallback: konverze přes aproximativní kurz, srovnání v CZK
+  const APPROX_KURZ: Record<string, number> = { EUR: 25.2, USD: 21.5, GBP: 29.5 }
+  // Měna: z faktury, nebo z pravidla dodavatele (přes supplierKeywords)
+  const skwForMena = supplierKeywords && supplierKeywords.length > 0 ? supplierKeywords : FALLBACK_SUPPLIER_KEYWORDS
+  const dodavatelLowerForMena = (faktura.dodavatel ?? '').toLowerCase()
+  const supplierEntryForMena = skwForMena.find(({ pattern }) => dodavatelLowerForMena.includes(pattern))
+  const fMena = faktura.mena || supplierEntryForMena?.mena || 'CZK'
+  const tCastkaAbs = Math.abs(t.castka)
+  let amtDiff: number
+  if (fMena !== 'CZK') {
+    const menaRegex = new RegExp(`([\\d.,]+)\\s*${fMena}`, 'i')
+    const m = t.zprava ? t.zprava.match(menaRegex) : null
+    if (m) {
+      const fxAmount = parseFloat(m[1].replace(',', '.'))
+      // Porovnáme faktura USD vs zpráva USD — obě ve stejné měně
+      amtDiff = (!isNaN(fxAmount) && fxAmount > 0)
+        ? Math.abs(fxAmount - faktura.castka_s_dph) / (faktura.castka_s_dph || 1)
+        : 1
+    } else {
+      // Fallback: převedeme fakturu na CZK, porovnáme s CZK transakcí (10% tolerance)
+      const fakturaCzk = faktura.castka_s_dph * (APPROX_KURZ[fMena] ?? 1)
+      amtDiff = Math.abs(tCastkaAbs - fakturaCzk) / (fakturaCzk || 1)
+    }
+  } else {
+    amtDiff = Math.abs(tCastkaAbs - faktura.castka_s_dph) / (faktura.castka_s_dph || 1)
+  }
   const vsMatch = !!(faktura.variabilni_symbol && t.variabilni_symbol === faktura.variabilni_symbol)
   const zprava = (t.zprava ?? '').toLowerCase()
   const dodavatelLower = (faktura.dodavatel ?? '').toLowerCase()
   const nameInZprava = !!(faktura.dodavatel && zprava.includes(dodavatelLower.split(' ')[0]))
-  const daysDiff = faktura.datum_splatnosti && t.datum
-    ? Math.abs((new Date(t.datum).getTime() - new Date(faktura.datum_splatnosti).getTime()) / 86400000)
+  // Pro kartu: splatnost neexistuje → fallback na datum_vystaveni (faktura se platí kartou v den vystavení)
+  const fakturaDatum = faktura.datum_splatnosti || faktura.datum_vystaveni || null
+  const daysDiff = fakturaDatum && t.datum
+    ? Math.abs((new Date(t.datum).getTime() - new Date(fakturaDatum).getTime()) / 86400000)
     : 999
 
-  // Negativní signál: zpráva kart. transakce obsahuje jiného dodavatele
-  if (t.typ === 'karta' || (!t.protiucet && t.zprava?.startsWith('Nákup'))) {
-    for (const [key, keywords] of Object.entries(KNOWN_SUPPLIER_KEYWORDS)) {
+  // Detekce kartové transakce
+  const isKarta = t.typ === 'karta' || (!t.protiucet && (t.zprava ?? '').startsWith('Nákup'))
+
+  if (isKarta) {
+    const skw = supplierKeywords && supplierKeywords.length > 0 ? supplierKeywords : FALLBACK_SUPPLIER_KEYWORDS
+    // Negativní signál: zpráva obsahuje jiného známého dodavatele
+    for (const { pattern, keywords } of skw) {
       const zpravaMatchesOther = keywords.some(kw => zprava.includes(kw))
-      const fakturaBelongsToThis = dodavatelLower.includes(key) || key === 'google' && dodavatelLower.includes('ireland')
+      const fakturaBelongsToThis = dodavatelLower.includes(pattern)
       if (zpravaMatchesOther && !fakturaBelongsToThis) {
-        // Zpráva jednoznačně ukazuje na jiného dodavatele → diskvalifikovat
-        return { t, score: -100, reasons: [`zpráva=${t.zprava?.slice(0, 20)} ≠ dodavatel`] }
+        return { t, score: -100, reasons: [`zpráva ≠ dodavatel`] }
       }
     }
-    // Pro kartové transakce: bez VS shody vyžadujeme alespoň shodu jména v zprávě
+
+    // Pro dodavatele se známými keywords (Seznam, Google…): 2-fázové párování
+    // Fáze 1 (identita): keyword MUSÍ být v popisu platby — jinak vyloučit
+    // Fáze 2 (kvalita): datum D+1→D+4 + částka určují confidence
+    const supplierEntry = skw.find(({ pattern }) => dodavatelLower.includes(pattern))
+    if (supplierEntry) {
+      if (!supplierEntry.keywords.some(kw => zprava.includes(kw))) {
+        return { t, score: 0, reasons: [`${supplierEntry.pattern}: chybí keyword v popisu`] }
+      }
+      // Identita potvrzena — score = částka(max 40) + datum(max 30) = max 70 → normalizace na SCORE_MAX
+      // Pro known suppliers keyword+částka potvrzují identitu — datum jen snižuje skóre, nekilluje match
+      const cardReasons: string[] = [`keyword ✓`]
+      let cardScore = 0
+      if (amtDiff < 0.01) { cardScore += 40; cardReasons.push('částka ✓') }
+      else if (amtDiff < 0.05) { cardScore += 25; cardReasons.push('částka ≈') }
+      else if (amtDiff < 0.15) { cardScore += 10; cardReasons.push('částka ~') }
+      else return { t, score: 0, reasons: cardReasons.concat(['částka ❌']) }
+      if (daysDiff <= 1) { cardScore += 30; cardReasons.push('datum D+1 ✓') }
+      else if (daysDiff <= 2) { cardScore += 22; cardReasons.push('datum D+2') }
+      else if (daysDiff <= 4) { cardScore += 15; cardReasons.push('datum D+4') }
+      else if (daysDiff <= 10) { cardScore += 8; cardReasons.push(`datum D+${Math.round(daysDiff)}`) }
+      else if (daysDiff <= 45) { cardScore += 4; cardReasons.push(`datum ~${Math.round(daysDiff)}d`) }
+      else { cardScore += 1; cardReasons.push(`datum ~${Math.round(daysDiff)}d`) }
+      return { t, score: Math.round((cardScore / 70) * SCORE_MAX), reasons: cardReasons }
+    }
+
+    // Ostatní kartové platby (bez definovaného dodavatele)
     if (!vsMatch && !nameInZprava) {
       return { t, score: 0, reasons: ['karta bez VS/název'] }
+    }
+    if (daysDiff > 4) {
+      return { t, score: 0, reasons: [`datum ❌ D+${Math.round(daysDiff)}`] }
     }
   }
 
@@ -161,28 +265,49 @@ function scoreCandidate(faktura: Faktura, t: Transakce): MatchCandidate {
   if (amtDiff < 0.01) { score += 40; reasons.push('částka ✓') }
   else if (amtDiff < 0.05) { score += 25; reasons.push('částka ≈') }
   else if (amtDiff < 0.15) { score += 10; reasons.push('částka ~') }
+
+  // Protiúčet — historický účet dodavatele
+  if (knownProtiucty && t.protiucet && knownProtiucty.has(t.protiucet)) {
+    score += 35; reasons.push('účet ✓')
+  }
+
   if (nameInZprava) { score += 15; reasons.push('název ✓') }
+
+  // Text platby — podobnost zprávy s historickými schválenými platbami
+  if (knownZpravy && knownZpravy.length > 0 && t.zprava) {
+    const tTokens = textTokens(t.zprava)
+    const maxOverlap = knownZpravy.reduce((best, hz) => {
+      const hTokens = textTokens(hz)
+      const shared = [...tTokens].filter(w => hTokens.has(w)).length
+      const union = new Set([...tTokens, ...hTokens]).size
+      return Math.max(best, union > 0 ? shared / union : 0)
+    }, 0)
+    if (maxOverlap >= 0.6) { score += 20; reasons.push('text ✓') }
+    else if (maxOverlap >= 0.35) { score += 10; reasons.push('text ~') }
+  }
+
   if (daysDiff <= 1) { score += 30; reasons.push('datum D+1 ✓') }
-  else if (daysDiff <= 2) { score += 22; reasons.push('datum D+2 ✓') }
+  else if (daysDiff <= 2) { score += 22; reasons.push('datum D+2') }
   else if (daysDiff <= 3) { score += 15; reasons.push('datum D+3') }
+  else if (daysDiff <= 4) { score += 8; reasons.push('datum D+4') }
   else if (daysDiff <= 7) { score += 5; reasons.push('datum ~7d') }
   else if (daysDiff <= 30) { score += 2; reasons.push('datum ~') }
 
   return { t, score, reasons }
 }
 
-function findTopMatches(faktura: Faktura, transakce: Transakce[], n = 3): MatchCandidate[] {
+function findTopMatches(faktura: Faktura, transakce: Transakce[], n = 3, knownProtiucty?: Set<string>, knownZpravy?: string[], supplierKeywords?: SupplierKwRule[]): MatchCandidate[] {
   const nespar = transakce.filter(t => t.stav === 'nesparovano' && t.castka < 0)
   return nespar
-    .map(t => scoreCandidate(faktura, t))
+    .map(t => scoreCandidate(faktura, t, knownProtiucty, knownZpravy, supplierKeywords))
     .filter(c => c.score >= 40)
     .sort((a, b) => b.score - a.score)
     .slice(0, n)
 }
 
-function findMatch(faktura: Faktura, transakce: Transakce[]): Transakce | null {
-  const top = findTopMatches(faktura, transakce, 1)
-  return top[0]?.t ?? null
+function findMatch(faktura: Faktura, transakce: Transakce[], knownProtiucty?: Set<string>, knownZpravy?: string[], supplierKeywords?: SupplierKwRule[]): MatchCandidate | null {
+  const top = findTopMatches(faktura, transakce, 1, knownProtiucty, knownZpravy, supplierKeywords)
+  return top[0] ?? null
 }
 
 type VysledovkaRow = { ucetni_kod: string; l1: string; l2: string; stredisko: string; mesice: Record<number, number> }
@@ -365,6 +490,7 @@ export default function Home() {
   const [pairedBanner, setPairedBanner] = useState<PairedSummaryItem[] | null>(null)
   const [pairedBannerExpanded, setPairedBannerExpanded] = useState(false)
 
+  const [pravidla, setPravidla] = useState<Pravidlo[]>([])
   const [transakce, setTransakce] = useState<Transakce[]>([])
   const [transakceLoading, setTransakceLoading] = useState(false)
   const [tFilter, setTFilter] = useState<TFilter>('vse')
@@ -378,9 +504,10 @@ export default function Home() {
   const [selectedPairs, setSelectedPairs] = useState<Map<number, number>>(new Map())
 
   const load = useCallback(async (year?: number) => {
-    const rok = year ?? selectedYear
+    // Rok je volitelný — bez roku vrací API všechny relevantní faktury (vč. starších)
+    const rokParam = year != null ? `?rok=${year}` : ''
     setLoading(true)
-    const res = await fetch(`/api/faktury?rok=${rok}`)
+    const res = await fetch(`/api/faktury${rokParam}`)
     const json = res.ok ? await res.json().catch(() => []) : []
     const data: Faktura[] = Array.isArray(json) ? json : []
     setFaktury(data)
@@ -396,7 +523,7 @@ export default function Home() {
         for (let i = 0; i < toClassify.length; i += batchSize) {
           const batch = toClassify.slice(i, i + batchSize)
           await Promise.all(batch.map(f => fetch(`/api/klasifikovat/${f.id}`, { method: 'POST' }).catch(() => {})))
-          const r = await fetch(`/api/faktury?rok=${rok}`)
+          const r = await fetch(`/api/faktury${rokParam}`)
           const updated = await r.json()
           if (Array.isArray(updated)) setFaktury(updated)
         }
@@ -410,6 +537,10 @@ export default function Home() {
     fetch('/api/kategorie').then(r => r.json()).then(setKategorieList).catch(() => {})
   }, [])
 
+  useEffect(() => {
+    fetch('/api/pravidla').then(r => r.json()).then(d => Array.isArray(d) && setPravidla(d)).catch(() => {})
+  }, [])
+
   const loadTransakce = useCallback(async (currentFaktury?: Faktura[], year?: number) => {
     const rok = year ?? selectedYear
     setTransakceLoading(true)
@@ -418,30 +549,56 @@ export default function Home() {
     setTransakce(data)
     setTransakceLoading(false)
 
-    // Auto-pair: faktura where both VS and amount match (within 5%)
+    // Auto-pair — dvě vlny, obě deduped přes usedTransakceIds
     const fList = currentFaktury ?? faktury
     const nespar = data.filter(t => t.stav === 'nesparovano')
     const pairedIds = new Set(data.filter(t => t.faktura_id !== null).map(t => t.faktura_id!))
     const autoPairs: { fakturaId: number; transakceId: number }[] = []
+    const autoPairedFakturaIds = new Set<number>()
     const usedTransakceIds = new Set<number>()
 
+    // Vlna 1: VS + amount přesná shoda (bankovní převody)
     for (const f of fList.filter(f => f.stav === 'schvalena' && !pairedIds.has(f.id))) {
       if (!f.variabilni_symbol) continue
       const match = nespar.find(t => {
         if (usedTransakceIds.has(t.id)) return false
         if (t.variabilni_symbol !== f.variabilni_symbol) return false
         if (Math.abs(Math.abs(t.castka) - f.castka_s_dph) / f.castka_s_dph >= 0.05) return false
-        // Kartové transakce: ověř že zpráva neobsahuje jiného dodavatele
         const isKarta = t.typ === 'karta' || (!t.protiucet && (t.zprava ?? '').startsWith('Nákup'))
         if (isKarta) {
-          const c = scoreCandidate(f, t)
+          const c = scoreCandidate(f, t, undefined, undefined, supplierKeywords)
           if (c.score <= 0) return false
         }
         return true
       })
       if (match) {
         autoPairs.push({ fakturaId: f.id, transakceId: match.id })
+        autoPairedFakturaIds.add(f.id)
         usedTransakceIds.add(match.id)
+      }
+    }
+
+    // Vlna 2: pravidla dodavatele (keyword+karta+datum) — confidence ≥ 90 %
+    // Faktury seřazeny dle best-score sestupně, aby nejsilnější vazba dostala přednost
+    const schvalenaKandidati = fList.filter(
+      f => f.stav === 'schvalena' && !pairedIds.has(f.id) && !autoPairedFakturaIds.has(f.id)
+    )
+    const preScoresCard = new Map<number, number>()
+    const availableForPre = nespar.filter(t => !usedTransakceIds.has(t.id))
+    for (const f of schvalenaKandidati) {
+      const top = findTopMatches(f, availableForPre, 1, undefined, undefined, supplierKeywords)
+      preScoresCard.set(f.id, top[0]?.score ?? 0)
+    }
+    const sortedKandidati = [...schvalenaKandidati].sort(
+      (a, b) => (preScoresCard.get(b.id) ?? 0) - (preScoresCard.get(a.id) ?? 0)
+    )
+    for (const f of sortedKandidati) {
+      const available = nespar.filter(t => !usedTransakceIds.has(t.id))
+      const match = findMatch(f, available, undefined, undefined, supplierKeywords)
+      if (!match) continue
+      if (scoreToConfidence(match.score) >= 90) {
+        autoPairs.push({ fakturaId: f.id, transakceId: match.t.id })
+        usedTransakceIds.add(match.t.id)
       }
     }
 
@@ -459,9 +616,9 @@ export default function Home() {
     }
   }, [selectedYear])
 
-  // Reload when year changes
+  // Reload when year changes — faktury bez roku filtruje API (vrátí vše), transakce filtruje rok
   useEffect(() => {
-    load(selectedYear)
+    load()
     loadTransakce(undefined, selectedYear)
     setVydane([])
     setChybejici(null)
@@ -474,10 +631,6 @@ export default function Home() {
   useEffect(() => {
     // Background ABRA sync — fire and forget, catches any gaps from previous sessions
     if (selectedYear === currentYear) fetch('/api/abra-sync', { method: 'POST' }).catch(() => {})
-    // Auto-parovani on mount — pair any matched invoices, then load today's summary
-    fetch('/api/auto-parovani', { method: 'POST' })
-      .then(() => { load(); loadTransakce() })
-      .catch(() => {})
 
     // Banner: always load today's auto-paired faktury from Supabase (persists across sessions)
     fetch('/api/dnes-sparovano')
@@ -493,11 +646,12 @@ export default function Home() {
   }, [tab])
 
   const [selectedSchvalena, setSelectedSchvalena] = useState<Set<number>>(new Set())
+  const [selectedZaplacena, setSelectedZaplacena] = useState<Set<number>>(new Set())
 
-  // Only handles zamítnout now
   const action = async (ids: number[], akce: 'zamítnout') => {
     setProcessing(true)
-    await Promise.all(ids.map(id => fetch(`/api/${akce}/${id}`, { method: 'POST' })))
+    // Použít ASCII cestu (zamítnout → zamitnout) kvůli Next.js routing
+    await Promise.all(ids.map(id => fetch(`/api/zamitnout/${id}`, { method: 'POST' })))
     await load()
     setProcessing(false)
   }
@@ -520,6 +674,20 @@ export default function Home() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fakturaId: id }),
     })
+    await loadTransakce()
+    setProcessing(false)
+  }
+
+  const zrusitZaplaceniBulk = async (ids: number[]) => {
+    setProcessing(true)
+    await Promise.all(ids.map(id =>
+      fetch('/api/zrusit-zaplaceni', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fakturaId: id }),
+      })
+    ))
+    setSelectedZaplacena(new Set())
     await loadTransakce()
     setProcessing(false)
   }
@@ -584,7 +752,10 @@ export default function Home() {
     nesparovana_mena: string
   }[] | null>(null)
   const filtered = (() => {
-    let base = tab === 'vse' ? faktury : isTransakceTab ? [] : faktury.filter(f => f.stav === tab)
+    let base = tab === 'vse' ? faktury
+      : isTransakceTab ? []
+      : tab === 'zamitnuta' ? faktury.filter(f => f.stav === 'zamitnuta' || f.stav === 'zam\u00edtnuta')
+      : faktury.filter(f => f.stav === tab)
     if (tab === 'nova' && onlyProblematic) {
       base = base.filter(f => !f.kategorie_id || f.stav_workflow === 'NEEDS_INFO')
     }
@@ -607,7 +778,10 @@ export default function Home() {
     return base
   })()
 
+  const [agentApproved, setAgentApproved] = useState<Set<number>>(new Set())
+
   // For schvalena tab: sort by datum_platby ascending
+  // For nova tab: agent-approved first, then rest
   const filteredSorted = tab === 'schvalena'
     ? [...filtered].sort((a, b) => {
         if (!a.datum_platby && !b.datum_platby) return 0
@@ -615,13 +789,44 @@ export default function Home() {
         if (!b.datum_platby) return -1
         return new Date(a.datum_platby).getTime() - new Date(b.datum_platby).getTime()
       })
+    : tab === 'nova' && agentApproved.size > 0
+    ? [...filtered].sort((a, b) => {
+        const aOk = agentApproved.has(a.id) ? 0 : 1
+        const bOk = agentApproved.has(b.id) ? 0 : 1
+        return aOk - bOk
+      })
     : filtered
 
   const novaFiltered = filtered.filter(f => f.stav === 'nova')
-  const count = (s: string) => faktury.filter(f => f.stav === s).length
+  const count = (s: string) => s === 'zamitnuta'
+    ? faktury.filter(f => f.stav === 'zamitnuta' || f.stav === 'zam\u00edtnuta').length
+    : faktury.filter(f => f.stav === s).length
   const allChecked = novaFiltered.length > 0 && novaFiltered.every(f => selected.has(f.id))
   const someChecked = novaFiltered.some(f => selected.has(f.id))
   const toggleAll = () => allChecked ? setSelected(new Set()) : setSelected(new Set(novaFiltered.map(f => f.id)))
+
+  const [suggestLoading, setSuggestLoading] = useState(false)
+  const [suggestStatus, setSuggestStatus] = useState<string | null>(null)
+
+  const agentSuggest = async () => {
+    setSuggestLoading(true)
+    setSuggestStatus('Účetní analyzuje faktury…')
+    try {
+      const res = await fetch('/api/agent/suggest', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rok: selectedYear }) })
+      const data = await res.json()
+      if (data.approved_ids?.length > 0) {
+        const ids = new Set<number>(data.approved_ids)
+        setAgentApproved(ids)
+        setSelected(ids)
+        setSuggestStatus(`Agent schválil ${data.approved_ids.length} faktur (${data.audited} auditováno)`)
+      } else {
+        setSuggestStatus('Agent nenašel žádné faktury ke schválení')
+      }
+    } catch {
+      setSuggestStatus('Chyba agenta')
+    }
+    setSuggestLoading(false)
+  }
   const toggle = (id: number) => {
     const next = new Set(selected)
     next.has(id) ? next.delete(id) : next.add(id)
@@ -642,6 +847,19 @@ export default function Home() {
     setSelectedSchvalena(next)
   }
   const selectedSchvalenaTotal = faktury.filter(f => selectedSchvalena.has(f.id)).reduce((s, f) => s + Number(f.castka_s_dph), 0)
+
+  const zaplacenaFiltered = filteredSorted.filter(f => f.stav === 'zaplacena')
+  const allZaplacenaChecked = zaplacenaFiltered.length > 0 && zaplacenaFiltered.every(f => selectedZaplacena.has(f.id))
+  const someZaplacenaChecked = zaplacenaFiltered.some(f => selectedZaplacena.has(f.id))
+  const toggleAllZaplacena = () => allZaplacenaChecked
+    ? setSelectedZaplacena(new Set())
+    : setSelectedZaplacena(new Set(zaplacenaFiltered.map(f => f.id)))
+  const toggleZaplacena = (id: number) => {
+    const next = new Set(selectedZaplacena)
+    next.has(id) ? next.delete(id) : next.add(id)
+    setSelectedZaplacena(next)
+  }
+  const selectedZaplacenaTotal = faktury.filter(f => selectedZaplacena.has(f.id)).reduce((s, f) => s + Number(f.castka_s_dph), 0)
 
   // Schvalena banner
   const schvalenaFaktury = faktury.filter(f => f.stav === 'schvalena')
@@ -671,19 +889,72 @@ export default function Home() {
   const schvalenaUnpaired = faktury.filter(f => f.stav === 'schvalena' && !skipped.has(f.id))
   const nesparTransakce = transakce.filter(t => t.stav === 'nesparovano')
 
-  // Sekvenční matching — každá transakce použita max jednou, faktury seřazeny dle data
-  const sequentialSuggestions = (() => {
-    const usedTransIds = new Set<number>()
-    const sorted = [...schvalenaUnpaired].sort((a, b) =>
-      new Date(a.datum_vystaveni).getTime() - new Date(b.datum_vystaveni).getTime()
-    )
-    const result = new Map<number, Transakce>()
-    for (const f of sorted) {
-      const available = transakce.filter(t => t.stav === 'nesparovano' && t.castka < 0 && !usedTransIds.has(t.id))
-      const match = findMatch(f, available)
-      if (match) { result.set(f.id, match); usedTransIds.add(match.id) }
+  const supplierKeywords = React.useMemo(() => {
+    const built = buildSupplierKeywords(pravidla)
+    return built.length > 0 ? built : FALLBACK_SUPPLIER_KEYWORDS
+  }, [pravidla])
+
+  // Historické lookup mapy pro scoring — z již spárovaných transakcí
+  const dodavatelHistory = (() => {
+    const ucty = new Map<string, Set<string>>()   // dodavatel → Set<protiucet>
+    const zpravy = new Map<string, string[]>()     // dodavatel → zprávy plateb
+    for (const t of transakce) {
+      if (t.stav !== 'sparovano' || !t.faktura_id) continue
+      const f = faktury.find(fa => fa.id === t.faktura_id)
+      if (!f?.dodavatel) continue
+      const d = f.dodavatel
+      if (t.protiucet) {
+        if (!ucty.has(d)) ucty.set(d, new Set())
+        ucty.get(d)!.add(t.protiucet)
+      }
+      if (t.zprava) {
+        if (!zpravy.has(d)) zpravy.set(d, [])
+        zpravy.get(d)!.push(t.zprava)
+      }
     }
-    return result
+    return { ucty, zpravy }
+  })()
+
+  // Sekvenční matching — každá transakce použita max jednou.
+  // Faktury se třídí dle nejlepšího skóre SESTUPNĚ — faktura s nejsilnější vazbou dostane přednost.
+  // (Jinak by starší faktura s D+4 68% sebrala transakci, která patří novější faktuře s D+1 99%.)
+  const { suggestions: sequentialSuggestions, scores: sequentialScores } = (() => {
+    const allAvailable = transakce.filter(t => t.stav === 'nesparovano' && t.castka < 0)
+    const preScores = new Map<number, number>()
+    for (const f of schvalenaUnpaired) {
+      const kp = dodavatelHistory.ucty.get(f.dodavatel)
+      const kz = dodavatelHistory.zpravy.get(f.dodavatel)
+      const top = findTopMatches(f, allAvailable, 1, kp, kz, supplierKeywords)
+      preScores.set(f.id, top[0]?.score ?? 0)
+    }
+    const sorted = [...schvalenaUnpaired].sort((a, b) =>
+      (preScores.get(b.id) ?? 0) - (preScores.get(a.id) ?? 0)
+    )
+    const usedTransIds = new Set<number>()
+    const suggestions = new Map<number, Transakce>()
+    const scores = new Map<number, MatchCandidate>()
+    for (const f of sorted) {
+      const available = allAvailable.filter(t => !usedTransIds.has(t.id))
+      const knownProtiucty = dodavatelHistory.ucty.get(f.dodavatel)
+      const knownZpravy = dodavatelHistory.zpravy.get(f.dodavatel)
+      const match = findMatch(f, available, knownProtiucty, knownZpravy, supplierKeywords)
+      if (match) { suggestions.set(f.id, match.t); scores.set(f.id, match); usedTransIds.add(match.t.id) }
+    }
+    return { suggestions, scores }
+  })()
+
+  // Pairing hints pro nova faktury — pouze informace, žádná akce
+  const novaPairingHints = (() => {
+    const novaFaktury = faktury.filter(f => f.stav === 'nova')
+    const allAvailable = transakce.filter(t => t.stav === 'nesparovano' && t.castka < 0)
+    const hints = new Map<number, MatchCandidate>()
+    for (const f of novaFaktury) {
+      const kp = dodavatelHistory.ucty.get(f.dodavatel)
+      const kz = dodavatelHistory.zpravy.get(f.dodavatel)
+      const match = findMatch(f, allAvailable, kp, kz, supplierKeywords)
+      if (match && scoreToConfidence(match.score) >= 65) hints.set(f.id, match)
+    }
+    return hints
   })()
 
   const withSuggestions = schvalenaUnpaired.filter(f => sequentialSuggestions.has(f.id))
@@ -728,11 +999,6 @@ export default function Home() {
   // ===== TRANSAKCE =====
   const filteredT = tFilter === 'vse' ? transakce : transakce.filter(t => t.stav === tFilter)
 
-  const [pravidla, setPravidla] = useState<Pravidlo[]>([])
-  useEffect(() => {
-    fetch('/api/pravidla').then(r => r.json()).then(d => Array.isArray(d) && setPravidla(d)).catch(() => {})
-  }, [])
-
   const [vydane, setVydane] = useState<FakturaVydana[]>([])
   const [vydaneLoading, setVydaneLoading] = useState(false)
   const [csvImporting, setCsvImporting] = useState(false)
@@ -775,7 +1041,79 @@ export default function Home() {
   } | null>(null)
   const [agentAnswer, setAgentAnswer] = useState('')
   const [needsInfoCount, setNeedsInfoCount] = useState(0)
-  const [caseMeta, setCaseMeta] = useState<Record<number, { confidence: number; source_of_rule: string; rezim: string }>>({})
+  const [caseMeta, setCaseMeta] = useState<Record<number, { confidence: number; sample_size: number; is_new: boolean; segment_key: string | null }>>({})
+
+  // ── Agent Recommendation panel ────────────────────────────────────────────
+  type DecisionRec = {
+    id: number; decision_type: string; status: string; created_at: string
+    decision_confidence: number; autonomy_confidence: number
+    recommendation_json: Record<string, unknown> | null
+    rules_applied_json: Record<string, unknown> | null
+    risks_text: string | null
+  }
+  type ConfidenceDetail = {
+    segment_key: string | null
+    accounting_suggest: { id: number; confidence: number; risks_text: string | null; recommendation: Record<string,unknown> | null; pravidlo_id: number | null } | null
+    pairing_suggest: { id: number; confidence: number } | null
+    profiles: Array<{ agent_id: string; confidence: number; sample_size: number; approval_clean_count: number; approval_with_edit_count: number; rejection_count: number }>
+    pravidlo: { id: number; dodavatel: string; confidence: number; md_ucet: string; zdroj: string } | null
+    pairing_detail: {
+      transakce: { id: number; datum: string; castka: number; mena: string; zprava: string; variabilni_symbol: string; protiucet: string | null }
+      match_fields: {
+        variabilni_symbol: { faktura: string|null; transakce: string|null; match: string }
+        castka: { faktura: number; transakce: number; diff_pct: number; match: string }
+        cislo_uctu: { faktura: string|null; transakce: string|null; match: string }
+        datum: { splatnost: string|null; platba: string|null; days_diff: number|null }
+      }
+      method: string | null; reasons: string[]; score: number | null
+    } | null
+    approval_history: Array<{ action: string; created_at: string }>
+    case: { id: number; status: string } | null
+  }
+  const [confidenceDetails, setConfidenceDetails] = useState<Record<number, ConfidenceDetail>>({})
+  const [decisionsByFaktura, setDecisionsByFaktura] = useState<Record<number, DecisionRec>>({})
+  const [expandedRec, setExpandedRec] = useState<number | null>(null)
+  const [recFeedbackState, setRecFeedbackState] = useState<Record<number, { loading: boolean; done: boolean; reason: string }>>({})
+
+  const loadDecisions = useCallback(async (ids: number[]) => {
+    if (!ids.length) return
+    // Načti decisions pro všechny faktury v batchi (max 20 najednou)
+    const batch = ids.slice(0, 20)
+    const results = await Promise.all(batch.map(id =>
+      fetch(`/api/decisions?faktura_id=${id}&limit=1`).then(r => r.json()).catch(() => [])
+    ))
+    const map: Record<number, DecisionRec> = {}
+    batch.forEach((id, i) => {
+      const rows = Array.isArray(results[i]) ? results[i] : []
+      if (rows[0]) map[id] = rows[0]
+    })
+    setDecisionsByFaktura(prev => ({ ...prev, ...map }))
+  }, [])
+
+  const loadConfidenceDetail = useCallback(async (fakturaId: number) => {
+    if (confidenceDetails[fakturaId]) return
+    const res = await fetch(`/api/confidence-detail/${fakturaId}`).catch(() => null)
+    if (!res?.ok) return
+    const data: ConfidenceDetail = await res.json().catch(() => null)
+    if (data) setConfidenceDetails(prev => ({ ...prev, [fakturaId]: data }))
+  }, [confidenceDetails])
+
+  const sendFeedback = async (fakturaId: number, decisionId: number, feedbackType: 'approved_clean' | 'approved_with_edit' | 'rejected', reason?: string) => {
+    setRecFeedbackState(prev => ({ ...prev, [fakturaId]: { loading: true, done: false, reason: reason ?? '' } }))
+    await fetch('/api/zpetna-vazba', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision_id: decisionId, feedback_type: feedbackType, feedback_source: 'human', reason }),
+    })
+    setRecFeedbackState(prev => ({ ...prev, [fakturaId]: { loading: false, done: true, reason: reason ?? '' } }))
+  }
+
+  // Načti decisions pro nova faktury po každém loadu faktury
+  useEffect(() => {
+    const novaIds = faktury.filter(f => f.stav === 'nova').map(f => f.id)
+    if (novaIds.length) loadDecisions(novaIds)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [faktury])
 
   // ── Control Tower state ────────────────────────────────────────────────────
   const [ctOpen, setCtOpen] = useState(false)
@@ -784,7 +1122,7 @@ export default function Home() {
   const [ctData, setCtData] = useState<{
     snapshot: Record<string, unknown>
     analysis: {
-      system_health: { overall_score: number; accounting_quality: number; audit_quality: number; workflow_quality: number; data_quality: number; architecture_quality: number; learning_quality: number; summary: string }
+      system_health: { overall_score: number; accounting_quality: number; audit_quality: number; workflow_quality: number; data_quality: number; learning_quality: number; summary: string }
       kpi_by_agent: Array<{ agent_name: string; strongest_area: string; weakest_area: string; risk_level: string; performance_summary: string }>
       critical_issues: Array<{ severity: string; type: string; owner_agent: string; title: string; symptom: string; root_cause: string; impact: string; recommended_fix: string }>
       patterns: Array<{ description: string; trend: string }>
@@ -793,7 +1131,7 @@ export default function Home() {
       orchestrator_tasking: {
         action_list: Array<{ action: string; priority: string; owner_agent: string; type: string; description: string; expected_impact: string }>
         system_decisions: { database: string[]; rules: string[]; prompts: string[]; workflow: string[] }
-        agent_task_assignments: { accountant: string[]; auditor: string[]; pm: string[]; architect: string[] }
+        agent_task_assignments: { accountant: string[]; auditor: string[]; pm: string[] }
         learning_actions: string[]
         top3_priorities: string[]
       }
@@ -1050,7 +1388,7 @@ export default function Home() {
       })
       if (!hasRule) {
         const ico = faktury.find(f => f.dodavatel === d)?.ico ?? null
-        result.push({ id: -(result.length + 1), dodavatel_pattern: d, ico, typ_platby: null, auto_schvalit: false, auto_parovat: false, poznamka: null, kategorie_id: null, _synthetic: true })
+        result.push({ id: -(result.length + 1), dodavatel_pattern: d, ico, typ_platby: null, auto_schvalit: false, auto_parovat: false, poznamka: null, kategorie_id: null, confidence: null, rule_scope: null, keyword: null, name_suplier: null, mena: null, _synthetic: true })
       }
     }
     return result.sort((a, b) => {
@@ -1190,7 +1528,7 @@ export default function Home() {
                   const cnt = t.key === 'sparovane' ? transakce.filter(tx => tx.stav === 'sparovano').length
                     : t.key === 'nesparovane' ? transakce.filter(tx => tx.stav === 'nesparovano').length
                     : t.key === 'vydane' ? vydane.length || null
-                    : t.key === 'vse' || t.key === 'vykazy' || t.key === 'abra' ? null
+                    : t.key === 'vse' || t.key === 'abra' ? null
                     : count(t.key)
                   const showRedBadge = (t.key === 'nova' || t.key === 'nesparovane' || (t.key === 'schvalena' && overdueSchvalena > 0)) && cnt && cnt > 0
                   return (
@@ -1205,7 +1543,7 @@ export default function Home() {
                       {cnt !== null && (
                         showRedBadge ? (
                           <span className="ml-1.5 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-bold">
-                            {t.key === 'schvalena' ? overdueSchvalena : cnt}
+                            {cnt}
                           </span>
                         ) : (
                           <span className="ml-1.5 text-[11px] text-gray-400">{cnt}</span>
@@ -1215,6 +1553,21 @@ export default function Home() {
                   )
                 })}
               </div>
+
+              {tab === 'nova' && selected.size === 0 && (
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={agentSuggest}
+                    disabled={suggestLoading}
+                    className="flex items-center gap-1.5 px-3 py-2 text-[12px] font-medium text-[#0071e3] bg-blue-50 hover:bg-blue-100 rounded-xl transition-colors disabled:opacity-40"
+                  >
+                    {suggestLoading ? (suggestStatus ?? 'Pracuji…') : '⚡ Agent zkontroluje'}
+                  </button>
+                  {suggestStatus && !suggestLoading && (
+                    <span className="text-[11px] text-gray-500">{suggestStatus}</span>
+                  )}
+                </div>
+              )}
 
               {selected.size > 0 && (
                 <div className="flex items-center gap-3 bg-white rounded-2xl px-4 py-2.5 shadow-sm border border-black/[0.06]">
@@ -1265,9 +1618,24 @@ export default function Home() {
                   </button>
                 </div>
               )}
+              {selectedZaplacena.size > 0 && (
+                <div className="flex items-center gap-3 bg-white rounded-2xl px-4 py-2.5 shadow-sm border border-black/[0.06]">
+                  <span className="text-[13px] text-gray-600">
+                    {selectedZaplacena.size} faktur · <span className="font-semibold text-gray-900">{fmt(selectedZaplacenaTotal, 'CZK')}</span>
+                  </span>
+                  <div className="w-px h-4 bg-gray-200" />
+                  <button
+                    onClick={() => zrusitZaplaceniBulk(Array.from(selectedZaplacena))}
+                    disabled={processing}
+                    className="text-[13px] font-medium text-red-600 hover:text-red-700 disabled:opacity-40"
+                  >
+                    {processing ? 'Zpracovávám…' : `Odschválit ${selectedZaplacena.size}`}
+                  </button>
+                </div>
+              )}
             </div>
 
-        {tab !== 'vykazy' && tab !== 'vydane' && tab !== 'abra' && (<>
+        {tab !== 'vydane' && tab !== 'abra' && (<>
             {/* Vyhledávání — všechny taby s fakturami */}
             {!isTransakceTab && (
               <div className="mb-4 flex items-center gap-2">
@@ -1423,6 +1791,15 @@ export default function Home() {
                             className="w-4 h-4 rounded accent-[#0071e3] cursor-pointer"
                           />
                         )}
+                        {zaplacenaFiltered.length > 0 && tab === 'zaplacena' && (
+                          <input
+                            type="checkbox"
+                            checked={allZaplacenaChecked}
+                            ref={el => { if (el) el.indeterminate = someZaplacenaChecked && !allZaplacenaChecked }}
+                            onChange={toggleAllZaplacena}
+                            className="w-4 h-4 rounded accent-[#0071e3] cursor-pointer"
+                          />
+                        )}
                       </th>
                       <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Dodavatel</th>
                       <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Faktura / VS</th>
@@ -1441,6 +1818,7 @@ export default function Home() {
                       const effectiveKategorieId = kategorieOverride.get(f.id) ?? f.kategorie_id ?? undefined
                       const kat = kategorieList.find(k => k.id === effectiveKategorieId)
                       const suggestion = f.stav === 'schvalena' ? (sequentialSuggestions.get(f.id) ?? null) : null
+                      const novaHint = f.stav === 'nova' ? (novaPairingHints.get(f.id) ?? null) : null
                       const pairedT = transakce.find(t => t.faktura_id === f.id && t.stav === 'sparovano')
                       const showPicker = activePicker === f.id
                       const isSchvalena = f.stav === 'schvalena'
@@ -1450,9 +1828,9 @@ export default function Home() {
                       return (
                         <Fragment key={f.id}>
                         <tr
-                          onClick={() => f.stav === 'nova' && toggle(f.id)}
+                          onClick={() => { if (f.stav === 'nova') { const next = expandedRec === f.id ? null : f.id; setExpandedRec(next); if (next) loadConfidenceDetail(next) } }}
                           className={`${i < filteredSorted.length - 1 || showPicker ? 'border-b border-gray-50' : ''} transition-colors ${
-                            selected.has(f.id) ? 'bg-blue-50/60' : isSchvalena ? 'bg-gray-50/40 hover:bg-gray-100/60' : 'hover:bg-[#f9f9f9]'
+                            selected.has(f.id) ? 'bg-blue-50/60' : expandedRec === f.id ? 'bg-indigo-50/40' : isSchvalena ? 'bg-gray-50/40 hover:bg-gray-100/60' : 'hover:bg-[#f9f9f9]'
                           } ${f.stav === 'nova' ? 'cursor-pointer' : ''} text-sm`}
                         >
                           <td className="px-4 py-2.5" onClick={e => e.stopPropagation()}>
@@ -1469,6 +1847,14 @@ export default function Home() {
                                 type="checkbox"
                                 checked={selectedSchvalena.has(f.id)}
                                 onChange={() => toggleSchvalena(f.id)}
+                                className="w-4 h-4 rounded accent-[#0071e3] cursor-pointer"
+                              />
+                            )}
+                            {f.stav === 'zaplacena' && (
+                              <input
+                                type="checkbox"
+                                checked={selectedZaplacena.has(f.id)}
+                                onChange={() => toggleZaplacena(f.id)}
                                 className="w-4 h-4 rounded accent-[#0071e3] cursor-pointer"
                               />
                             )}
@@ -1490,6 +1876,30 @@ export default function Home() {
                             {f.stav_workflow === 'NEEDS_INFO' && f.blocker && (
                               <div className="text-[10px] text-amber-600 mt-0.5 line-clamp-1">{f.blocker}</div>
                             )}
+                            {/* Confidence badge — ze segmentu (confidence_profiles) */}
+                            {(() => {
+                              const cm = caseMeta[f.id]
+                              if (!cm) return null
+                              const pct = Math.round(cm.confidence * 100)
+                              const isNew = cm.is_new
+                              const src = (cm as Record<string,unknown>).source as string | undefined
+                              const label = isNew
+                                ? `nový dodavatel · ${pct}%`
+                                : src === 'pravidlo'
+                                  ? `${pct}% · pravidlo`
+                                  : `${pct}% · n=${cm.sample_size}`
+                              const color = isNew
+                                ? 'bg-gray-100 text-gray-500'
+                                : pct >= 80 ? 'bg-green-50 text-green-700'
+                                : pct >= 60 ? 'bg-amber-50 text-amber-600'
+                                : 'bg-red-50 text-red-500'
+                              return (
+                                <div className={`inline-flex items-center gap-1 mt-1 text-[9px] font-semibold px-1.5 py-0.5 rounded ${color}`}
+                                  title={cm.segment_key ?? ''}>
+                                  {label}
+                                </div>
+                              )
+                            })()}
                           </td>
                           {/* col: Faktura / VS */}
                           <td className="px-4 py-2.5">
@@ -1582,8 +1992,8 @@ export default function Home() {
                                       caseMeta[f.id].confidence >= 85 ? 'bg-green-50 text-green-600' :
                                       caseMeta[f.id].confidence >= 60 ? 'bg-amber-50 text-amber-600' :
                                       'bg-red-50 text-red-500'
-                                    }`} title={caseMeta[f.id].source_of_rule}>
-                                      {caseMeta[f.id].confidence}% · {caseMeta[f.id].source_of_rule || caseMeta[f.id].rezim}
+                                    }`} title={caseMeta[f.id].segment_key ?? ''}>
+                                      {Math.round(caseMeta[f.id].confidence * 100)}% · {caseMeta[f.id].is_new ? 'nový dodavatel' : (caseMeta[f.id] as Record<string,unknown>).source === 'pravidlo' ? 'pravidlo' : `n=${caseMeta[f.id].sample_size}`}
                                     </span>
                                   )}
                                 </div>
@@ -1611,16 +2021,62 @@ export default function Home() {
                             </div>
                           </td>
                         </tr>
+                        {/* Sub-řádek: pairing hint pro nova faktury — pouze informace */}
+                        {f.stav === 'nova' && novaHint && (() => {
+                          const pairConf = scoreToConfidence(novaHint.score)
+                          const amtOk = Math.abs(Math.abs(novaHint.t.castka) - Number(f.castka_s_dph)) < 1
+                          return (
+                            <tr className="border-b border-amber-100/60 bg-amber-50/20">
+                              <td className="pl-4 pr-0 py-1.5 text-amber-400 text-[11px]">↳</td>
+                              <td className="px-4 py-1.5 max-w-0">
+                                <div className="text-[11px] text-gray-500 truncate">{(novaHint.t.zprava || '—').substring(0, 60)}</div>
+                                <div className={`inline-flex items-center gap-1 mt-0.5 text-[9px] font-semibold px-1.5 py-0.5 rounded ${
+                                  pairConf >= 80 ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'
+                                }`} title={novaHint.reasons.join(' · ')}>
+                                  platba nalezena · {pairConf}% · {novaHint.reasons.join(' · ')}
+                                </div>
+                              </td>
+                              <td className="px-4 py-1.5">
+                                <span className="text-[11px] font-mono text-gray-400">VS {novaHint.t.variabilni_symbol || '—'}</span>
+                              </td>
+                              <td></td>
+                              <td className="px-4 py-1.5 text-[11px] text-gray-400">{fmtDate(novaHint.t.datum)}</td>
+                              <td></td>
+                              <td className="px-4 py-1.5 text-right">
+                                <span className={`text-[12px] font-semibold ${amtOk ? 'text-green-600' : 'text-orange-500'}`}>
+                                  {fmt(Math.abs(novaHint.t.castka), novaHint.t.mena)}
+                                </span>
+                              </td>
+                              <td className="px-4 py-1.5 text-right" onClick={e => e.stopPropagation()}>
+                                <button onClick={() => setActivePicker(f.id)}
+                                  className="px-3 py-1 text-[11px] font-medium text-amber-700 bg-amber-100 rounded-[7px] hover:bg-amber-200 whitespace-nowrap">
+                                  Párovat
+                                </button>
+                              </td>
+                            </tr>
+                          )
+                        })()}
                         {/* Sub-řádek: navrhovaná platba (schvalena) — 7 cols aligned */}
                         {f.stav === 'schvalena' && suggestion && !showPicker && !rejectedSuggestions.has(f.id) && (() => {
                           const vsOk = !!f.variabilni_symbol && suggestion.variabilni_symbol === f.variabilni_symbol
                           const amtOk = Math.abs(Math.abs(suggestion.castka) - Number(f.castka_s_dph)) < 1
+                          const mc = sequentialScores.get(f.id)
+                          const pairConf = mc ? scoreToConfidence(mc.score) : null
                           return (
                             <tr className="border-b border-blue-100/60 bg-blue-50/25">
                               <td className="pl-4 pr-0 py-2 text-blue-400 text-[11px]">↳</td>
-                              {/* Dodavatel col: zpráva platby */}
+                              {/* Dodavatel col: zpráva platby + confidence */}
                               <td className="px-4 py-2 max-w-0">
                                 <div className="text-[12px] text-gray-500 truncate">{(suggestion.zprava || suggestion.protiucet || '—').substring(0, 60)}</div>
+                                {pairConf !== null && mc && (
+                                  <div className={`inline-flex items-center gap-1 mt-0.5 text-[9px] font-semibold px-1.5 py-0.5 rounded ${
+                                    pairConf >= 80 ? 'bg-green-100 text-green-700' :
+                                    pairConf >= 55 ? 'bg-amber-50 text-amber-600' :
+                                    'bg-gray-100 text-gray-500'
+                                  }`} title={mc.reasons.join(' · ')}>
+                                    {pairConf}% shoda · {mc.reasons.join(' · ')}
+                                  </div>
+                                )}
                               </td>
                               {/* Faktura/VS col: TX VS (srovnej s FA VS výše) */}
                               <td className="px-4 py-2">
@@ -1661,6 +2117,155 @@ export default function Home() {
                             </tr>
                           )
                         })()}
+                        {/* Sub-řádek: Agent Recommendation panel (nova faktury s decision záznamen) */}
+                        {f.stav === 'nova' && expandedRec === f.id && (() => {
+                          const dec = decisionsByFaktura[f.id]
+                          const cd = confidenceDetails[f.id]
+                          const fbState = recFeedbackState[f.id]
+                          const cm = caseMeta[f.id]
+                          const sug = cd?.accounting_suggest
+                          const sugPct = sug ? Math.round(sug.confidence * 100) : dec ? Math.round(dec.decision_confidence * 100) : (cm?.confidence ?? null)
+                          const profile = cd?.profiles?.[0] ?? null
+                          const profPct = profile ? Math.round((profile.confidence as number) * 100) : null
+                          const rec = (sug?.recommendation ?? dec?.recommendation_json) as Record<string,unknown> | null
+                          const kat = rec?.kategorie_id ? kategorieList.find(k => k.id === Number(rec.kategorie_id)) : null
+                          const pairingDetail = cd?.pairing_detail ?? null
+
+                          const ConfBar = ({ label, pct, sub }: { label: string; pct: number; sub?: string }) => (
+                            <div className="flex items-center gap-2 min-w-0">
+                              <span className="text-[11px] text-gray-500 w-32 shrink-0">{label}</span>
+                              <div className="w-28 h-1.5 bg-gray-200 rounded-full overflow-hidden shrink-0">
+                                <div className={`h-full rounded-full ${pct >= 85 ? 'bg-green-500' : pct >= 65 ? 'bg-amber-400' : 'bg-red-400'}`} style={{ width: `${pct}%` }} />
+                              </div>
+                              <span className={`text-[12px] font-bold tabular-nums ${pct >= 85 ? 'text-green-600' : pct >= 65 ? 'text-amber-600' : 'text-red-500'}`}>{pct}%</span>
+                              {sub && <span className="text-[10px] text-gray-400">{sub}</span>}
+                            </div>
+                          )
+                          const matchIcon = (m: string) => m === 'exact' || m === 'match' ? '✓' : m === 'partial' || m === 'close' ? '~' : '✗'
+                          const matchColor = (m: string) => m === 'exact' || m === 'match' ? 'text-green-600' : m === 'partial' || m === 'close' ? 'text-amber-600' : 'text-red-400'
+
+                          return (
+                            <tr className="border-b border-indigo-100/60 bg-indigo-50/20">
+                              <td colSpan={8} className="px-6 py-4" onClick={e => e.stopPropagation()}>
+                                <div className="flex flex-col gap-4">
+                                  {/* Header */}
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-[11px] font-semibold text-indigo-600 uppercase tracking-wider">Doporučení agenta</span>
+                                    {(sug ?? dec) && <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-600 font-mono">#{sug?.id ?? dec?.id}</span>}
+                                    {cd?.segment_key && <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-500 font-mono">{cd.segment_key}</span>}
+                                  </div>
+
+                                  {/* Confidence breakdown — účetnictví */}
+                                  <div className="flex flex-col gap-2">
+                                    {sugPct !== null && <ConfBar label="Návrh agenta" pct={sugPct} sub="jistota tohoto návrhu" />}
+                                    {profPct !== null && <ConfBar label="Segment (historie)" pct={profPct} sub={`n=${profile?.sample_size ?? 0}, ✓${profile?.approval_clean_count ?? 0} ±${profile?.approval_with_edit_count ?? 0} ✗${profile?.rejection_count ?? 0}`} />}
+                                    {cd?.pravidlo && <ConfBar label="Pravidlo" pct={cd.pravidlo.confidence as number} sub={`${cd.pravidlo.md_ucet} · ${cd.pravidlo.zdroj}`} />}
+                                  </div>
+
+                                  {/* Párování detail — field-level match */}
+                                  {pairingDetail && (
+                                    <div className="flex flex-col gap-1.5">
+                                      <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Párování — shoda polí</span>
+                                      <div className="grid grid-cols-2 gap-x-8 gap-y-1 text-[11px]">
+                                        {[
+                                          { label: 'VS', val: pairingDetail.match_fields.variabilni_symbol.match, detail: `${pairingDetail.match_fields.variabilni_symbol.faktura ?? '—'} / ${pairingDetail.match_fields.variabilni_symbol.transakce ?? '—'}` },
+                                          { label: 'Částka', val: pairingDetail.match_fields.castka.match, detail: `${pairingDetail.match_fields.castka.faktura} vs ${pairingDetail.match_fields.castka.transakce} (${pairingDetail.match_fields.castka.diff_pct}%)` },
+                                          { label: 'Číslo účtu', val: pairingDetail.match_fields.cislo_uctu.match, detail: pairingDetail.match_fields.cislo_uctu.transakce ?? '—' },
+                                          { label: 'Datum', val: pairingDetail.match_fields.datum.days_diff !== null && pairingDetail.match_fields.datum.days_diff <= 5 ? 'close' : 'none', detail: pairingDetail.match_fields.datum.days_diff !== null ? `${pairingDetail.match_fields.datum.days_diff} dní` : '—' },
+                                        ].map(row => (
+                                          <div key={row.label} className="flex items-center gap-1.5">
+                                            <span className={`font-bold w-4 ${matchColor(row.val)}`}>{matchIcon(row.val)}</span>
+                                            <span className="text-gray-500 w-16">{row.label}</span>
+                                            <span className="text-gray-700">{row.detail}</span>
+                                          </div>
+                                        ))}
+                                      </div>
+                                      <div className="flex items-center gap-2 mt-1">
+                                        <span className="text-[10px] text-gray-400">metoda:</span>
+                                        <span className="text-[11px] font-medium text-indigo-600">{pairingDetail.method ?? '?'}</span>
+                                        {pairingDetail.score !== null && <span className="text-[10px] text-gray-400">skóre {Math.round((pairingDetail.score as number) * 100)}%</span>}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Doporučení detail */}
+                                  <div className="flex flex-wrap items-center gap-3 text-[12px]">
+                                    {kat && (
+                                      <span className="px-2.5 py-1 rounded-lg bg-purple-50 border border-purple-100 text-purple-800 font-medium">
+                                        {kat.l1} / {kat.l2} · {kat.ucetni_kod}
+                                      </span>
+                                    )}
+                                    {cm?.segment_key && !kat && (
+                                      <span className="px-2 py-1 rounded-lg bg-gray-50 border border-gray-100 text-gray-600">
+                                        {cm.segment_key}
+                                      </span>
+                                    )}
+                                    {(sug?.risks_text ?? dec?.risks_text) && (
+                                      <span className="px-2 py-1 rounded-lg bg-amber-50 border border-amber-100 text-amber-700 text-[11px]">
+                                        ⚠ {sug?.risks_text ?? dec?.risks_text}
+                                      </span>
+                                    )}
+                                    {cd?.approval_history?.length > 0 && (
+                                      <span className="text-[10px] text-gray-400">{cd.approval_history[0].action} · {new Date(cd.approval_history[0].created_at).toLocaleDateString('cs-CZ')}</span>
+                                    )}
+                                  </div>
+
+                                  {/* Akce */}
+                                  {fbState?.done ? (
+                                    <div className="text-[12px] text-green-600 font-medium">✓ Zpětná vazba odeslána</div>
+                                  ) : dec ? (
+                                    <div className="flex items-center gap-2">
+                                      <button
+                                        disabled={fbState?.loading}
+                                        onClick={async () => {
+                                          await sendFeedback(f.id, dec.id, 'approved_clean')
+                                          setExpandedRec(null)
+                                          schvalitAZaplatit(f.id, kategorieOverride.get(f.id) ?? f.kategorie_id ?? undefined)
+                                        }}
+                                        className="px-4 py-1.5 text-[12px] font-medium text-white bg-green-600 rounded-[8px] hover:bg-green-700 disabled:opacity-40">
+                                        Schválit ✓
+                                      </button>
+                                      <button
+                                        disabled={fbState?.loading}
+                                        onClick={async () => {
+                                          const r = window.prompt('Důvod úpravy (povinné):')
+                                          if (!r) return
+                                          await sendFeedback(f.id, dec.id, 'approved_with_edit', r)
+                                          schvalitAZaplatit(f.id, kategorieOverride.get(f.id) ?? f.kategorie_id ?? undefined)
+                                        }}
+                                        className="px-4 py-1.5 text-[12px] font-medium text-[#0071e3] bg-blue-50 rounded-[8px] hover:bg-blue-100 disabled:opacity-40">
+                                        Upravit + potvrdit
+                                      </button>
+                                      <button
+                                        disabled={fbState?.loading}
+                                        onClick={async () => {
+                                          const r = window.prompt('Důvod zamítnutí (povinné):')
+                                          if (!r) return
+                                          await sendFeedback(f.id, dec.id, 'rejected', r)
+                                          action([f.id], 'zamítnout')
+                                        }}
+                                        className="px-4 py-1.5 text-[12px] font-medium text-red-600 bg-red-50 rounded-[8px] hover:bg-red-100 disabled:opacity-40">
+                                        Zamítnout
+                                      </button>
+                                      <button
+                                        onClick={async () => {
+                                          // Eskalace → nastavit case jako high_risk (placeholder)
+                                          await fetch(`/api/zamitnout/${f.id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'Eskalováno jako high_risk' }) })
+                                          await load()
+                                        }}
+                                        className="ml-2 px-3 py-1.5 text-[12px] font-medium text-orange-600 bg-orange-50 rounded-[8px] hover:bg-orange-100">
+                                        Eskalovat ⚠
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <div className="text-[11px] text-gray-400">Decision zatím neexistuje — použij tlačítka ve sloupci akce.</div>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          )
+                        })()}
+
                         {/* Sub-řádek: spárovaná transakce (zaplacena) — jen zpráva + datum */}
                         {f.stav === 'zaplacena' && pairedT && (
                           <tr className="border-b border-green-100/60 bg-green-50/20">
@@ -1672,8 +2277,8 @@ export default function Home() {
                             <td colSpan={2}></td>
                           </tr>
                         )}
-                        {f.stav === 'schvalena' && showPicker && (() => {
-                          const topMatches = findTopMatches(f, transakce)
+                        {(f.stav === 'schvalena' || f.stav === 'nova') && showPicker && (() => {
+                          const topMatches = findTopMatches(f, transakce, 3, undefined, undefined, supplierKeywords)
                           return (
                             <tr className="border-b border-gray-50 bg-gray-50/50">
                               <td colSpan={7} className="px-6 py-3">
@@ -1932,10 +2537,6 @@ export default function Home() {
               </div>
             )}
           </div>
-        )}
-
-        {tab === 'vykazy' && (
-          <VykazVysledovka rok={selectedYear} />
         )}
 
         {/* ===== ABRA CHECK ===== */}
@@ -2343,7 +2944,6 @@ export default function Home() {
                           ['Audit', sh.audit_quality],
                           ['Workflow', sh.workflow_quality],
                           ['Data', sh.data_quality],
-                          ['Architecture', sh.architecture_quality],
                           ['Learning', sh.learning_quality],
                         ].map(([label, val]) => (
                           <div key={String(label)} className="bg-white/60 rounded-xl px-3 py-2">
@@ -2361,7 +2961,6 @@ export default function Home() {
                         { key: 'accountant', label: 'ACCOUNTANT', color: 'text-blue-700', bg: 'bg-blue-50', bar: 'bg-blue-400', errLabel: 'chyb ACC' },
                         { key: 'auditor', label: 'AUDITOR', color: 'text-purple-700', bg: 'bg-purple-50', bar: 'bg-purple-400', errLabel: 'propuštěno' },
                         { key: 'pm', label: 'PM', color: 'text-green-700', bg: 'bg-green-50', bar: 'bg-green-400', errLabel: 'chyb PM' },
-                        { key: 'architect', label: 'ARCHITECT', color: 'text-amber-700', bg: 'bg-amber-50', bar: 'bg-amber-400', errLabel: 'chyb ARCH' },
                       ]
                       return (
                         <div>
@@ -2604,7 +3203,7 @@ export default function Home() {
                                   {new Date(e.created_at).toLocaleDateString('cs-CZ')}
                                 </div>
                               </div>
-                              {e.feedback_type && e.feedback_type !== 'architecture_finding' && (
+                              {e.feedback_type && (
                                 <button
                                   onClick={async () => {
                                     await fetch('/api/agent/learn', {

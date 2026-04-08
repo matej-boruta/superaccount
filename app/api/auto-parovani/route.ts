@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { callClaude, SYSTEM_AUDIT } from '@/lib/claude'
-import { writeRozhodnuti } from '@/lib/rules'
+import { createSuggest } from '@/lib/suggest'
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!
@@ -72,33 +72,43 @@ async function getKurz(mena: string, datum: string): Promise<number> {
 type CardRule = {
   id: number
   keyword: string
+  nazevDodavatele: string  // z name_suplier
   dodavatelMatch: string
   autoSchvalit: boolean
   limitKc: number
   confidence: number
+  mena: string | null  // cizí měna dodavatele (USD, EUR, …) nebo null pro CZK
 }
+
+let _cardRulesDebug: unknown = null  // diagnostika — viditelná v response
 
 async function getCardRules(): Promise<CardRule[]> {
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/pravidla?typ=eq.parovani&aktivni=eq.true&keyword=not.is.null` +
-      `&select=id,keyword,dodavatel_pattern,limit_kc,confidence`,
+      `${SUPABASE_URL}/rest/v1/pravidla?aktivni=eq.true&keyword=not.is.null` +
+      `&select=id,keyword,dodavatel_pattern,limit_kc,confidence,mena`,
       { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
     )
     const rows: {
       id: number; keyword: string; dodavatel_pattern: string
-      limit_kc: number; confidence: number
+      limit_kc: number; confidence: number; mena: string | null
     }[] = await res.json()
+    _cardRulesDebug = Array.isArray(rows) ? `${rows.length} rows` : rows
     if (!Array.isArray(rows)) return []
     return rows.map(r => ({
       id: r.id,
+      nazevDodavatele: (r.dodavatel_pattern ?? '').replace(/%/g, '').trim(),
       keyword: r.keyword.toUpperCase(),
       dodavatelMatch: (r.dodavatel_pattern ?? '').replace(/%/g, '').toUpperCase(),
       autoSchvalit: (r.confidence ?? 0) >= 90,
       limitKc: r.limit_kc ?? 10000,
       confidence: r.confidence ?? 80,
+      mena: r.mena ?? null,
     }))
-  } catch { return [] }
+  } catch (e) {
+    _cardRulesDebug = String(e)
+    return []
+  }
 }
 
 async function matchByCard(
@@ -123,28 +133,40 @@ async function matchByCard(
   // Amount match — handle EUR/USD faktury vs CZK bank transactions
   const fCastka = Number(f.castka_s_dph)
   const tCastka = Math.abs(Number(t.castka))
-  const fMena = String(f.mena || 'CZK')
+  // Mena: z faktury, nebo z pravidla (pokud faktura nemá vyplněno)
+  const fMena = String(f.mena || matchingRule.mena || 'CZK')
   const tMena = String(t.mena || 'CZK')
 
   let amountMatch = false
   if (fMena === tMena) {
     amountMatch = Math.abs(tCastka - fCastka) < 1
   } else if (fMena !== 'CZK' && tMena === 'CZK') {
-    // Faktura in EUR/USD, transaction in CZK — convert via ČNB rate
-    const tDate = String(t.datum || '').split('T')[0]
-    const kurz = await getKurz(fMena, tDate)
-    const fCzkEquiv = fCastka * kurz
-    // Allow 2% tolerance for exchange rate differences
-    amountMatch = Math.abs(tCastka - fCzkEquiv) / fCzkEquiv < 0.02
+    // Faktura in EUR/USD, transaction in CZK
+    // First try: extract foreign amount from zprava (e.g. "částka  44.95 USD") and compare directly
+    const fxRegex = new RegExp(`([\\d.,]+)\\s*${fMena}`, 'i')
+    const fxMatch = String(t.zprava || '').match(fxRegex)
+    if (fxMatch) {
+      const fxAmount = parseFloat(fxMatch[1].replace(',', '.'))
+      if (!isNaN(fxAmount) && fxAmount > 0) {
+        amountMatch = Math.abs(fxAmount - fCastka) / (fCastka || 1) < 0.01
+      }
+    }
+    if (!amountMatch) {
+      // Fallback: convert via ČNB rate (5% tolerance)
+      const tDate = String(t.datum || '').split('T')[0]
+      const kurz = await getKurz(fMena, tDate)
+      const fCzkEquiv = fCastka * kurz
+      amountMatch = Math.abs(tCastka - fCzkEquiv) / (fCzkEquiv || 1) < 0.05
+    }
   }
   if (!amountMatch) return false
 
-  // Date: "dne" date from zprava = datum when card was charged (= datum_splatnosti).
-  // Bank posts it D+1. Tolerance ±2 days for weekends/holidays.
+  // Date: "dne" date from zprava = datum when card was charged (≈ datum_splatnosti).
+  // Bank posts D+1..D+4 for weekends/holidays. Tolerance ±5 days.
   const fDate = String(f.datum_splatnosti || f.datum_vystaveni || '').split('T')[0]
   const tDate = extractDateFromZprava(String(t.zprava || '')) ?? String(t.datum || '').split('T')[0]
   if (!fDate || !tDate) return false
-  if (daysDiff(fDate, tDate) > 2) return false
+  if (daysDiff(fDate, tDate) > 5) return false
 
   return true
 }
@@ -240,7 +262,7 @@ async function createAbraFakturaPrijata(
 }
 
 async function pairInSupabase(fakturaId: number, transakceId: number) {
-  await Promise.all([
+  const [tRes, fRes] = await Promise.all([
     fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}`, {
       method: 'PATCH',
       headers: SB_HEADERS,
@@ -252,6 +274,8 @@ async function pairInSupabase(fakturaId: number, transakceId: number) {
       body: JSON.stringify({ stav: 'zaplacena', stav_workflow: 'POSTED', zauctovano_at: new Date().toISOString() }),
     }),
   ])
+  if (!tRes.ok) throw new Error(`transakce PATCH failed: ${tRes.status}`)
+  if (!fRes.ok) throw new Error(`faktura PATCH failed: ${fRes.status}`)
 }
 
 async function createAbraBanka(
@@ -388,6 +412,80 @@ Zkontroluj:
   }
 }
 
+/**
+ * Google Ads M:N párování — speciální pass.
+ * VS faktury "928-782-6458" → accountId "9287826458" → hledáme v zpravě transakce "9287826458".
+ * Součet všech Ads tx se stejným accountId za billing period musí sedět s fakturou ±5%.
+ */
+async function pairGoogleAds(
+  faktury: Record<string, unknown>[],
+  transakce: Record<string, unknown>[],
+  usedTxIds: Set<number>
+): Promise<{ faktura_id: number; transakce_id: number; match: string }[]> {
+  const results: { faktura_id: number; transakce_id: number; match: string }[] = []
+
+  // Google Ireland faktury (ICO IE6388047V nebo dodavatel contains 'google ireland')
+  const googleFaktury = faktury.filter(f =>
+    String(f.ico || '').toUpperCase() === 'IE6388047V' ||
+    String(f.dodavatel || '').toUpperCase().includes('GOOGLE IRELAND')
+  )
+
+  for (const f of googleFaktury) {
+    const vs = String(f.variabilni_symbol || '').replace(/-/g, '')
+    if (!vs) continue
+
+    const fakturaId = f.id as number
+    const fMena = String(f.mena || 'CZK')
+
+    // Filtrujeme transakce STEJNÉHO měsíce jako faktura (Google Ads billings jsou měsíční)
+    const fakturaMonth = String(f.datum_vystaveni || f.datum_splatnosti || '').slice(0, 7)
+
+    const pool = transakce.filter(t => {
+      if (usedTxIds.has(t.id as number)) return false
+      const zprava = String(t.zprava || '').replace(/[^0-9A-Z]/gi, '')
+      if (!zprava.toUpperCase().includes(vs.toUpperCase())) return false
+      if (!String(t.zprava || '').toUpperCase().includes('ADS')) return false
+      // Měsíční filtr — pokud známe měsíc faktury
+      if (fakturaMonth) {
+        const tMonth = String(t.datum || '').slice(0, 7)
+        if (tMonth !== fakturaMonth) return false
+      }
+      return true
+    })
+
+    if (pool.length === 0) continue
+
+    const poolSum = pool.reduce((s, t) => s + Math.abs(Number(t.castka)), 0)  // vždy CZK
+
+    // Pokud je faktura v jiné měně než CZK → převeď na CZK
+    let fCastka = Number(f.castka_s_dph)
+    if (fMena !== 'CZK') {
+      const sampleDate = String(pool[0]?.datum || '').split('T')[0]
+      const kurz = sampleDate ? await getKurz(fMena, sampleDate) : 25.0
+      fCastka = fCastka * kurz
+    }
+
+    const tolerance = fCastka * 0.10  // 10% tolerance pro kurz a zaokrouhlení
+    if (Math.abs(poolSum - fCastka) > tolerance) continue
+
+    // Součet sedí — párujeme
+    for (const t of pool) {
+      usedTxIds.add(t.id as number)
+      await fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${t.id}`, {
+        method: 'PATCH', headers: SB_HEADERS,
+        body: JSON.stringify({ stav: 'sparovano', faktura_id: fakturaId }),
+      })
+      results.push({ faktura_id: fakturaId, transakce_id: t.id as number, match: `google_ads_mn_${vs}` })
+    }
+    await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}`, {
+      method: 'PATCH', headers: SB_HEADERS,
+      body: JSON.stringify({ stav: 'zaplacena', stav_workflow: 'POSTED' }),
+    })
+  }
+
+  return results
+}
+
 export async function POST() {
   // PRAVIDLO: příchozí platby (castka >= 0) se NIKDY nespárují s přijatými fakturami.
   // Párujeme výhradně odchozí platby (castka < 0) — peníze jdou od nás k dodavateli.
@@ -399,7 +497,8 @@ export async function POST() {
       headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
     }),
     // Pouze odchozí platby (castka < 0) — příchozí platby se s fakturami nespárují nikdy
-    fetch(`${SUPABASE_URL}/rest/v1/transakce?stav=eq.nesparovano&castka=lt.0&select=*`, {
+    // Načítáme nova + nesparovano — nova jsou čerstvě importované z Fio
+    fetch(`${SUPABASE_URL}/rest/v1/transakce?stav=in.(nova,nesparovano)&castka=lt.0&select=*`, {
       headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
     }),
   ])
@@ -409,50 +508,26 @@ export async function POST() {
   const transakce: Record<string, unknown>[] = await tRes.json()
 
   const results: { faktura_id: number; transakce_id: number; match: string }[] = []
-  const autoApproved: number[] = []
 
   // Load card rules from ucetni_pravidla (dynamic, includes Twilio/Daktela/etc.)
   const cardRules = await getCardRules()
 
-  // ── PRE-KROK: auto-schvalit nova faktury pro known card suppliers ──────────
-  // Podmínky: pravidlo má auto_schvalit=true + faktura má kategorie_id + castka <= limit
-  // Logika: pokud dodavatel je v pravidlech karta a confidence >= 80, není to nový dodavatel
-  const cardKeywords = new Set(cardRules.filter(r => r.autoSchvalit).map(r => r.dodavatelMatch).filter(Boolean))
+  // Auto-schvalení deaktivováno — faktury schvaluje pouze člověk
+  void cardRules  // cardRules used only for pairing, not for approval
 
-  for (const f of nova) {
-    if (f.stav !== 'nova' || !f.kategorie_id) continue
-    const dodavatel = String(f.dodavatel || '').toUpperCase()
-    const matchingRule = cardRules.find(r =>
-      r.autoSchvalit &&
-      r.dodavatelMatch.length > 0 &&
-      dodavatel.includes(r.dodavatelMatch) &&
-      Number(f.castka_s_dph) <= r.limitKc &&
-      r.confidence >= 80
-    )
-    if (!matchingRule) continue
-
-    // Auto-approve: nova → schvalena
-    await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${f.id}`, {
-      method: 'PATCH',
-      headers: SB_HEADERS,
-      body: JSON.stringify({ stav: 'schvalena' }),
-    })
-    f.stav = 'schvalena'  // update local copy
-    autoApproved.push(f.id as number)
-    schvalena.push(f)     // přidej do schvalena poolu pro VS matching
-  }
-  // Odstraň auto-schválené z nova poolu
-  const novaPo = nova.filter(f => !autoApproved.includes(f.id as number))
-
-  void cardKeywords  // used implicitly via matchingRule
+  const novaPo = nova
 
   // ── CARD TRANSACTIONS: match nova + schvalena faktury via supplier name + amount + date ──
   const cardTranakce = transakce.filter(t => t.typ === 'Platba kartou')
 
+  // ── GOOGLE ADS M:N PAIRING: VS = account ID embedded in zprava (sum monthly) ──
+  const mnPaired = new Set<number>() // transakce IDs already used
+  const googleAdsResults = await pairGoogleAds([...novaPo, ...schvalena], transakce, mnPaired)
+  results.push(...googleAdsResults)
+
   // ── M:N PAIRING: one invoice = many card transactions (e.g. Google Ads monthly invoice) ──
   // Strategy: sort invoices largest first, use greedy subset matching with 5% tolerance.
   // Multiple invoices from same supplier in same month → try to match each individually.
-  const mnPaired = new Set<number>() // transakce IDs already used
 
   // Sort invoices: process SMALLEST amounts first — menší faktury dostanou přesnou podmnožinu
   // transakcí, zbývající transakce pak přesně odpovídají velké faktuře
@@ -525,17 +600,19 @@ export async function POST() {
       const tCastka = Math.abs(Number(t.castka))
 
       if (isAutoConf) {
-        await fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}`, {
+        const tPatch = await fetch(`${SUPABASE_URL}/rest/v1/transakce?id=eq.${transakceId}`, {
           method: 'PATCH',
           headers: SB_HEADERS,
           body: JSON.stringify({ stav: 'sparovano', faktura_id: fakturaId }),
         })
+        if (!tPatch.ok) throw new Error(`M:N transakce PATCH failed: ${tPatch.status}`)
         if (firstPair) {
-          await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}`, {
+          const fPatch = await fetch(`${SUPABASE_URL}/rest/v1/faktury?id=eq.${fakturaId}`, {
             method: 'PATCH',
             headers: SB_HEADERS,
             body: JSON.stringify({ stav: 'zaplacena', stav_workflow: 'POSTED', zauctovano_at: new Date().toISOString() }),
           })
+          if (!fPatch.ok) throw new Error(`M:N faktura PATCH failed: ${fPatch.status}`)
           firstPair = false
         }
         if (abraFaId) {
@@ -597,13 +674,12 @@ export async function POST() {
         // Automatické párování — conf >= 90
         const abraFaId = await createAbraFakturaPrijata(f, true)
         await pairInSupabase(fakturaId, transakceId)
-        writeRozhodnuti({
-          entity_type: 'faktura', entity_id: fakturaId,
-          faktura_id: fakturaId, transakce_id: transakceId,
-          typ: 'parovani', agent: 'accountant',
+        createSuggest({
+          faktura_id: fakturaId,
+          type: 'pairing',
+          recommendation_json: { faktura_id: fakturaId, transakce_id: transakceId, method: 'card', score: cardConf / 100, reasons: ['keyword_match', 'auto_pair'] },
+          confidence: cardConf / 100,
           pravidlo_id: matchedRule?.id ?? null,
-          navrh: { castka: f.castka_s_dph, match_type: 'card', keyword: matchedRule?.keyword },
-          confidence: cardConf, stav: 'accepted', zdroj: 'auto_parovani',
         }).catch(() => {})
         if (abraFaId) await createAbraBanka(f, match, abraFaId)
         auditAbraBooking(f, '518500', '221001', Number(f.castka_s_dph), 'card').catch(() => {})
@@ -623,13 +699,12 @@ export async function POST() {
             }),
           }),
         ])
-        writeRozhodnuti({
-          entity_type: 'faktura', entity_id: fakturaId,
-          faktura_id: fakturaId, transakce_id: transakceId,
-          typ: 'parovani', agent: 'accountant',
+        createSuggest({
+          faktura_id: fakturaId,
+          type: 'pairing',
+          recommendation_json: { faktura_id: fakturaId, transakce_id: transakceId, method: 'card', score: cardConf / 100, reasons: ['keyword_match', 'pending_confirmation'] },
+          confidence: cardConf / 100,
           pravidlo_id: matchedRule?.id ?? null,
-          navrh: { castka: f.castka_s_dph, match_type: 'card_proposed', keyword: matchedRule?.keyword },
-          confidence: cardConf, stav: 'proposed', zdroj: 'auto_parovani',
         }).catch(() => {})
         results.push({ faktura_id: fakturaId, transakce_id: transakceId, match: 'card_navrzeno' })
       }
@@ -727,18 +802,12 @@ export async function POST() {
 
     await pairInSupabase(fakturaId, transakceId)
 
-    // Zapiš rozhodnutí párování s entity_id
-    writeRozhodnuti({
-      entity_type: 'faktura',
-      entity_id: fakturaId,
+    // Zapiš suggest párování
+    createSuggest({
       faktura_id: fakturaId,
-      transakce_id: transakceId,
-      typ: 'parovani',
-      agent: 'accountant',
-      navrh: { variabilni_symbol: fVs, castka: fCastka, match_type: matchType },
-      confidence: matchType === 'vs+castka' ? 95 : matchType === 'vs' ? 80 : 70,
-      stav: 'accepted',
-      zdroj: 'auto_parovani',
+      type: 'pairing',
+      recommendation_json: { faktura_id: fakturaId, transakce_id: transakceId, method: 'vs', score: (matchType === 'vs+castka' ? 95 : matchType === 'vs' ? 80 : 70) / 100, reasons: [matchType, 'auto_pair'] },
+      confidence: (matchType === 'vs+castka' ? 95 : matchType === 'vs' ? 80 : 70) / 100,
     }).catch(() => {})
 
     try {
@@ -834,5 +903,18 @@ export async function POST() {
     results.push({ faktura_id: fakturaId, transakce_id: transakceId, match: matchType })
   }
 
-  return NextResponse.json({ ok: true, paired: results.length, auto_approved: autoApproved.length, results })
+  // ── Označit zbývající nova transakce jako nesparovano ──
+  // Transakce co přišly jako nova a nepodařilo se je spárovat → nesparovano (čekají na manuální párování)
+  const pairedTranIds = new Set(results.map(r => r.transakce_id))
+  const novaUnpaired = transakce.filter(t => t.stav === 'nova' && !pairedTranIds.has(t.id as number))
+  if (novaUnpaired.length > 0) {
+    const ids = novaUnpaired.map(t => t.id).join(',')
+    await fetch(`${SUPABASE_URL}/rest/v1/transakce?id=in.(${ids})`, {
+      method: 'PATCH',
+      headers: SB_HEADERS,
+      body: JSON.stringify({ stav: 'nesparovano' }),
+    })
+  }
+
+  return NextResponse.json({ ok: true, paired: results.length, auto_approved: 0, marked_nesparovano: novaUnpaired.length, results, _debug: { cardRules: _cardRulesDebug } })
 }
